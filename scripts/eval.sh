@@ -25,6 +25,15 @@ THR="${THR:-0.99}"; BS="${BS:-8}"; LIMIT="${LIMIT:-0}"
 case "$MODE" in diffusion|ar) ;; *) echo "ERROR: MODE must be diffusion|ar (got $MODE)"; exit 2 ;; esac
 
 read -r GT EVALSET < <(gt_for_scale "$SCALE")
+# LIMIT caps INFERENCE only -- the scorer always reads the whole GT file, so a limited run scores the
+# missing pages as empty. Keep it out of the canonical run folder so a smoke test can never be mistaken
+# for (or block) the real one.
+if [ "${LIMIT:-0}" != "0" ]; then
+  EVALSET="${EVALSET}-limit${LIMIT}"
+  echo "!!  LIMIT=$LIMIT: inference stops after $LIMIT pages but scoring still uses the full GT,"
+  echo "!!  so score.json is a smoke test, NOT a benchmark number. Run folder tagged '$EVALSET'."
+  echo "!!  For a real subset benchmark use a matching subset GT (SCALE=200 with ODB_GT_200)."
+fi
 IMAGES="${IMAGES:-$ROOT/omnidocbench/images}"
 # labels
 NAME="${NAME:-$(basename "$(dirname "$MODEL")")}"

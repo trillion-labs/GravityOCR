@@ -25,13 +25,16 @@ path verifies them, so decoding advances several tokens per forward pass while p
 AR-greedy output. The released checkpoint is additionally trained with GRPO on the AR path using
 sequence- and structure-level OCR rewards.
 
-| | OmniDocBench v1.6 Overall ↑ | tokens / forward | end-to-end vs AR |
-|---|---|---|---|
-| GLM-OCR (reported) | 95.48 | 1.0 | 1.00× |
-| GravityOCR, AR path before RL | 94.92 | 1.0 | — |
-| **GravityOCR, self-speculative** | **95.16** | **9.6** | **1.34×** (3.85× token-generation rate) |
+| Model | Decode | OmniDocBench v1.6 Overall ↑ | tokens / forward | pages/s ↑ |
+|---|---|---|---|---|
+| GLM-OCR (base) | AR | 95.48 | 1.0 | 0.571 |
+| GravityOCR | AR | 95.16 | 1.0 | 0.554 |
+| **GravityOCR** | **self-speculative** | **95.16** | **9.7** | **0.730** (1.32× the AR path) |
 
-Speed: SGLang serving, decode measured at the HTTP boundary. Score: official OmniDocBench protocol
+The two GravityOCR rows score the same because they produce the same text. On region crops the gain is
+3.94× on decode alone and 1.74× end to end.
+
+Speed: SGLang serving, one H100, batch size 1, measured at the HTTP boundary. Score: official OmniDocBench protocol
 and aggregation. Paper: *Diffusion Drafts, AR Verifies: Lossless Parallel Decoding for Document OCR*
 (Trillion Labs, 2026). Code, serving patch and evaluation protocol:
 [github.com/trillion-labs/GravityOCR](https://github.com/trillion-labs/GravityOCR).
@@ -78,7 +81,7 @@ Prompts follow GLM-OCR: `Text Recognition:`, `Table Recognition:` (HTML output),
 
 ### Self-speculative decoding (the point of this model)
 
-Same weights, ~9.6 tokens per forward pass, output identical to the AR path above.
+Same weights, ~9.7 tokens committed per forward pass, output identical to the AR path above.
 
 - **Serving:** SGLang v0.5.12 with the patch in the code repository (`patches/sglang/`), then
   `bash serve/serve_sglang_ocr.sh MODE=spec CKPT=trillionlabs/GravityOCR` — an OpenAI-compatible

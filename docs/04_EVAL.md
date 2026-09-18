@@ -23,6 +23,12 @@ bash scripts/eval.sh MODE=ar MODEL=zai-org/GLM-OCR SCALE=full NAME=base   # plai
 Options: `MODE=diffusion|ar` · `SCALE=full|200` (default full = the benchmark) · `THR=0.99` · `BS=8` ·
 `LIMIT=0` · `NAME=<label>` · `STEP=<n>` · `TOKFWD=1|0` (also run the tok/fwd bench; needs `VAL_PAGES`).
 
+`LIMIT=<n>` stops **inference** after n pages; the scorer still reads the whole ground-truth file, so the
+missing pages count as empty and the score is meaningless as a benchmark. It is a plumbing smoke test
+only, and the wrapper tags its run folder `-limit<n>` so it can never be mistaken for the real run. For a
+genuine subset number use a ground-truth file that contains exactly those pages (`SCALE=200`
+with `ODB_GT_200`).
+
 ## What it produces
 
 `runs/<NAME>__s<STEP>__<MODE>__thr<THR>__<evalset>/`:

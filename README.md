@@ -1,24 +1,66 @@
 # GravityOCR — Diffusion Drafts, AR Verifies
 
 **Lossless parallel decoding for document OCR.** GravityOCR is [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR)
-(CogViT + 0.5B decoder) fine-tuned so that a *single* set of weights acts as both a block-diffusion
-drafter and an autoregressive verifier. The diffusion path proposes a block of tokens in parallel;
-the causal AR path verifies them; accepted tokens advance decoding by several positions per round.
-Output is identical to AR greedy decoding — the model only gets faster.
+(CogViT + 0.5B decoder) fine-tuned so that one set of weights acts as both a block-diffusion drafter and
+an autoregressive verifier. The diffusion path proposes a whole block of tokens in a single forward pass;
+the causal path verifies them and commits the longest prefix that matches what it would have produced
+itself. In exact arithmetic the output *is* the AR greedy output — the model only gets faster.
 
-| | OmniDocBench v1.6 Overall ↑ | tokens / forward | end-to-end vs AR |
-|---|---|---|---|
-| GLM-OCR (reported) | 95.48 | 1.0 | 1.00× |
-| GravityOCR, AR path (pre-RL) | 94.92 | 1.0 | — |
-| **GravityOCR, self-speculative (released)** | **95.16** | **9.6** | **1.34×** (3.85× token-generation rate) |
+![AR vs self-speculative decoding](assets/ar_vs_selfspec.gif)
 
-Speed figures are from the SGLang serving deployment (`serve/SGLANG_SERVE.md`); score is the official OmniDocBench protocol and aggregation. Paper: *Diffusion Drafts, AR Verifies:
+*Left: autoregressive decoding, one token per forward. Right: the same weights decoding the same crop
+self-speculatively. Both panels sit on the same clock — one frame is one forward pass — so the right
+panel finishing first is exactly the speedup: 150 forwards against 10.*
+
+## How it works
+
+One round is two forward passes:
+
+1. **Draft.** Append `B` mask tokens to the committed prefix and run one bidirectional forward over
+   `[x₀ | B masks]`. Every mask position produces a token, so the model proposes a whole block at once.
+   Block diffusion is what makes this possible: tokens inside a block are predicted in parallel, without
+   conditioning on one another.
+2. **Verify.** Run one causal forward over the committed prefix plus the draft. Each position now carries
+   the AR prediction it would have had in ordinary decoding. Commit the first draft token (it needed no
+   draft context, so it is always right), then the longest run of draft tokens that agree with the AR
+   predictions, then one bonus token — the AR prediction at the first disagreement is correct by
+   construction. A round advances by up to `B+2` tokens.
+
+Nothing outside the shared weights is involved: no drafter network, no extra prediction head, no
+speculation-specific parameters. The verifier is the same model that drafts, because training optimizes
+both paths at once.
+
+![One draft-verify round at a time](assets/selfspec_rounds.gif)
+
+*The mechanism on its own, one forward per frame: a pale block is a draft; on the verify pass the accepted
+prefix turns solid while a rejected token is struck through and replaced by the verifier's own token.
+Colours mark which round committed each token.*
+
+## Results
+
+OmniDocBench v1.6, full resolution, official protocol and page-level aggregation. Speed is SGLang, one
+H100, batch size 1, the same client and page set for every row.
+
+| Model | Decode | Overall ↑ | TPF ↑ | tok/s ↑ | pages/s ↑ |
+|---|---|---|---|---|---|
+| GLM-OCR (base) | AR | 95.48 | 1.0 | 807 | 0.571 |
+| GravityOCR | AR | 95.16 | 1.0 | 794 | 0.554 |
+| **GravityOCR** | **self-speculative** | **95.16** | **9.7** | **1,047** | **0.730** |
+
+TPF = tokens committed per forward pass. The two GravityOCR rows score the same because they produce the
+same text: **1.32× more pages per second at identical quality**. On region crops, where the per-request
+fixed cost is a smaller share of the wall clock, the gain is **3.94× on decode alone** and **1.74× end to
+end**. Under bf16 serving kernels the two paths agree exactly on 96.6% of crops; the rest are
+floating-point tie-breaks, not algorithmic drift.
+
+Details, ablations and the rest of the evaluation are in the paper: *Diffusion Drafts, AR Verifies:
 Lossless Parallel Decoding for Document OCR* (Trillion Labs, 2026).
 
-- **Model:** [`trillionlabs/GravityOCR`](https://huggingface.co/trillionlabs/GravityOCR) (MIT) — a standard
-  `GlmOcrForConditionalGeneration` checkpoint plus `block_diffusion.json`. Loads in stock `transformers>=5.8`
-  for AR decoding; self-speculative decoding needs this repo (in-process) or the SGLang patch (serving).
-- **Serving implementation:** `patches/sglang/` — self-speculative block-diffusion decoding on SGLang v0.5.12.
+- **Weights:** [`trillionlabs/GravityOCR`](https://huggingface.co/trillionlabs/GravityOCR) (MIT) — a
+  standard `GlmOcrForConditionalGeneration` checkpoint plus `block_diffusion.json`. Stock
+  `transformers>=5.8` loads it for AR decoding; self-speculative decoding needs this repository
+  (in process) or the SGLang patch (serving).
+- **Serving:** `patches/sglang/` — self-speculative block-diffusion decoding on SGLang v0.5.12.
 
 ## Repository layout
 
