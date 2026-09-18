@@ -1,0 +1,27 @@
+base commit: 1519acf37c23f2189adb93f57ca9cd2db1bebf18 [Hotfix] Fix router gemm on sm103 (#22134)
+ M python/pyproject.toml
+ M python/sglang/srt/dllm/config.py
+ M python/sglang/srt/dllm/mixin/req.py
+ M python/sglang/srt/dllm/mixin/scheduler.py
+ M python/sglang/srt/layers/attention/flashinfer_backend.py
+ M python/sglang/srt/managers/schedule_policy.py
+ M python/sglang/srt/managers/scheduler.py
+ M python/sglang/srt/managers/tokenizer_manager.py
+ M python/sglang/srt/mem_cache/radix_cache.py
+ M python/sglang/srt/model_executor/cuda_graph_runner.py
+ M python/sglang/srt/model_executor/forward_batch_info.py
+ M python/sglang/srt/model_executor/model_runner.py
+ M python/sglang/srt/models/glm4v.py
+ M python/sglang/srt/models/glm_ocr.py
+ M python/sglang/srt/server_args.py
+ M python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
+ M python/sglang/srt/speculative/ngram_info.py
+ M python/sglang/srt/speculative/spec_info.py
+?? python/sglang/srt/dllm/algorithm/glm_ocr_selfspec.py
+?? python/sglang/srt/managers/tokenizer_manager.py.orig-declat
+?? python/sglang/srt/speculative/selfspec_diffusion_worker.py
+?? python/sglang/srt/speculative/selfspec_diffusion_worker.py.bak-0804
+?? python/sglang/srt/speculative/selfspec_diffusion_worker.py.bak-0805
+?? python/sglang/srt/speculative/selfspec_diffusion_worker.py.orig-logprob
+?? python/sglang/srt/speculative/selfspec_diffusion_worker.py.orig-updw
+?? python/uv.lock

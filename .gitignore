@@ -1,0 +1,18 @@
+# generated / local
+.generated_by_build_release_tree
+__pycache__/
+*.pyc
+.venv*/
+**/.venv*/
+*.log
+*.out
+wandb/
+
+# large or run-local artifacts — never committed
+checkpoints/
+runs/
+logs/
+results/
+omnidocbench
+scorer
+odb_gt_seed0_200.json
