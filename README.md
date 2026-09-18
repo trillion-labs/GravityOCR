@@ -16,15 +16,15 @@ panel finishing first is exactly the speedup: 150 forwards against 10.*
 
 One round is two forward passes:
 
-1. **Draft.** Append `B` mask tokens to the committed prefix and run one bidirectional forward over
-   `[x₀ | B masks]`. Every mask position produces a token, so the model proposes a whole block at once.
-   Block diffusion is what makes this possible: tokens inside a block are predicted in parallel, without
-   conditioning on one another.
-2. **Verify.** Run one causal forward over the committed prefix plus the draft. Each position now carries
-   the AR prediction it would have had in ordinary decoding. Commit the first draft token (it needed no
-   draft context, so it is always right), then the longest run of draft tokens that agree with the AR
-   predictions, then one bonus token — the AR prediction at the first disagreement is correct by
-   construction. A round advances by up to `B+2` tokens.
+1. **Draft.** Append `B` mask tokens to the boundary token `x₀` and run one forward pass, the mask block
+   attending within itself and causally to the cached prefix. That single pass returns both a causal
+   token `a₀`, which conditions only on committed context, and `B` draft tokens `d₁…d_B` predicted in
+   parallel — block diffusion is what lets a whole block be proposed at once, with no iterative
+   unmasking and no confidence-based selection.
+2. **Verify.** Run one causal forward over `[a₀, d₁…d_B]`, which yields the AR predictions `a₁…a_{B+1}`
+   and, in the same pass, the KV cache for whatever is accepted. Commit `a₀`, then the longest draft
+   prefix with `dⱼ = aⱼ`, then `a_{A+1}` — correct by construction, and the boundary token of the next
+   round. Rejected states are discarded. A round therefore advances by up to `B+2` tokens.
 
 Nothing outside the shared weights is involved: no drafter network, no extra prediction head, no
 speculation-specific parameters. The verifier is the same model that drafts, because training optimizes

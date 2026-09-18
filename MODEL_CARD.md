@@ -34,6 +34,11 @@ sequence- and structure-level OCR rewards.
 The two GravityOCR rows score the same because they produce the same text. On region crops the gain is
 3.94× on decode alone and 1.74× end to end.
 
+![AR vs self-speculative decoding](assets/ar_vs_selfspec.gif)
+
+*The same weights decoding the same crop, one frame per forward pass: autoregressive on the left,
+self-speculative on the right. 150 forwards against 10, same output.*
+
 Speed: SGLang serving, one H100, batch size 1, measured at the HTTP boundary. Score: official OmniDocBench protocol
 and aggregation. Paper: *Diffusion Drafts, AR Verifies: Lossless Parallel Decoding for Document OCR*
 (Trillion Labs, 2026). Code, serving patch and evaluation protocol:
