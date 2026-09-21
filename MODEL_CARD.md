@@ -37,7 +37,7 @@ The two GravityOCR rows score the same because they produce the same text. On re
 ![AR vs self-speculative decoding](assets/ar_vs_selfspec.gif)
 
 *The same weights decoding the same crop: autoregressive on the left, self-speculative on the right.
-Forward counts as measured — 150 against 10 — with the right panel played at one-fifth of the left
+Forward counts as measured — 150 against 10 — with the right panel played at one-quarter of the left
 panel's wall time rather than at the raw forward ratio.*
 
 Speed: SGLang serving, one H100, batch size 1, measured at the HTTP boundary. Score: official OmniDocBench protocol
