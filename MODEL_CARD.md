@@ -16,7 +16,7 @@ tags:
 
 # GravityOCR
 
-**Diffusion drafts, AR verifies — lossless parallel decoding for document OCR.**
+**Diffusion drafts, AR verifies — accelerating document OCR with self-speculative decoding.**
 
 GravityOCR is [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR) (CogViT vision encoder + 0.5B
 text decoder) jointly fine-tuned with a block-diffusion objective and an autoregressive objective on
@@ -36,11 +36,12 @@ The two GravityOCR rows score the same because they produce the same text. On re
 
 ![AR vs self-speculative decoding](assets/ar_vs_selfspec.gif)
 
-*The same weights decoding the same crop, one frame per forward pass: autoregressive on the left,
-self-speculative on the right. 150 forwards against 10, same output.*
+*The same weights decoding the same crop: autoregressive on the left, self-speculative on the right.
+Forward counts as measured — 150 against 10 — with the right panel played at one-seventh of the left
+panel's wall time rather than at the raw forward ratio.*
 
 Speed: SGLang serving, one H100, batch size 1, measured at the HTTP boundary. Score: official OmniDocBench protocol
-and aggregation. Paper: *Diffusion Drafts, AR Verifies: Lossless Parallel Decoding for Document OCR*
+and aggregation. Paper: *Diffusion Drafts, AR Verifies: Accelerating Document OCR with Self-Speculative Decoding*
 (Trillion Labs, 2026). Code, serving patch and evaluation protocol:
 [github.com/trillion-labs/GravityOCR](https://github.com/trillion-labs/GravityOCR).
 
@@ -103,10 +104,12 @@ Same weights, ~9.7 tokens committed per forward pass, output identical to the AR
    structure penalties and scorer-identical markup normalization; lr 3e-6, 28 generations per prompt,
    KL β=1e-3, token-level truncated importance sampling. This card's checkpoint is step 500 of that run.
 
-Training data: 10.8M region-level examples from public document datasets (DocGenome, Docmatix,
-PubTables-1M, FinTabNet, SynthTabNet, PubTabNet, RVL-CDIP, DocLayNet, UniMER), ~60/20/20 text /
-table / formula, predominantly English; pages overlapping the evaluation sets were removed.
-The assembled pool is not redistributed.
+Training data: a pool of 12.3M region-level examples assembled from predominantly public data (DocGenome,
+Docmatix, PubTables-1M, FinTabNet, SynthTabNet, PubTabNet, RVL-CDIP, DocLayNet, and the training split of
+UniMER) — layout regions cropped from full pages at native resolution, with targets transcribed by the base
+GLM-OCR except for table crops from sources with cell-level annotations (about 39% of the table stream).
+The table and formula streams are subsampled to a 60/20/20 stream ratio, giving a 10.8M training set,
+predominantly English.
 
 ## Intended use and limitations
 
@@ -123,7 +126,7 @@ MIT, inheriting GLM-OCR's MIT license.
 
 ```bibtex
 @techreport{gravityocr2026,
-  title  = {Diffusion Drafts, AR Verifies: Lossless Parallel Decoding for Document OCR},
+  title  = {Diffusion Drafts, AR Verifies: Accelerating Document OCR with Self-Speculative Decoding},
   author = {Trillion Labs},
   year   = {2026}
 }

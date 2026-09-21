@@ -1,6 +1,6 @@
 # GravityOCR — Diffusion Drafts, AR Verifies
 
-**Lossless parallel decoding for document OCR.** GravityOCR is [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR)
+**Accelerating document OCR with self-speculative decoding.** GravityOCR is [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR)
 (CogViT + 0.5B decoder) fine-tuned so that one set of weights acts as both a block-diffusion drafter and
 an autoregressive verifier. The diffusion path proposes a whole block of tokens in a single forward pass;
 the causal path verifies them and commits the longest prefix that matches what it would have produced
@@ -9,8 +9,9 @@ itself. In exact arithmetic the output *is* the AR greedy output — the model o
 ![AR vs self-speculative decoding](assets/ar_vs_selfspec.gif)
 
 *Left: autoregressive decoding, one token per forward. Right: the same weights decoding the same crop
-self-speculatively. Both panels sit on the same clock — one frame is one forward pass — so the right
-panel finishing first is exactly the speedup: 150 forwards against 10.*
+self-speculatively. The forward counts are the measured ones — 150 against 10 — while the right panel is
+played at one-seventh of the left panel's wall time rather than at the raw forward ratio, since a block
+forward costs more than a single-token forward.*
 
 ## How it works
 
@@ -54,7 +55,7 @@ end**. Under bf16 serving kernels the two paths agree exactly on 96.6% of crops;
 floating-point tie-breaks, not algorithmic drift.
 
 Details, ablations and the rest of the evaluation are in the paper: *Diffusion Drafts, AR Verifies:
-Lossless Parallel Decoding for Document OCR* (Trillion Labs, 2026).
+Accelerating Document OCR with Self-Speculative Decoding* (Trillion Labs, 2026).
 
 - **Weights:** [`trillionlabs/GravityOCR`](https://huggingface.co/trillionlabs/GravityOCR) (MIT) — a
   standard `GlmOcrForConditionalGeneration` checkpoint plus `block_diffusion.json`. Stock
@@ -142,16 +143,22 @@ comparable within one page set — always state it (`docs/DECODE_PATHS.md`).
 
 ## Data
 
-The model was fine-tuned on 10.8M region-level examples (~60/20/20 page-text / table / formula,
-predominantly English) assembled from public document datasets — DocGenome, Docmatix, PubTables-1M,
-FinTabNet, SynthTabNet, PubTabNet, RVL-CDIP, DocLayNet, UniMER — with targets produced by GLM-OCR and
-filtered as described in the paper. **The assembled pool is not redistributed.**
+The training pool contains 12.3M region-level examples assembled from predominantly public data —
+DocGenome, Docmatix, PubTables-1M, FinTabNet, SynthTabNet, PubTabNet, RVL-CDIP, DocLayNet, and the training
+split of UniMER. Each example is a layout region cropped from a full page at native resolution, paired with a
+text target: for full-page sources the regions come from the same PP-DocLayout-V3 detector used at inference,
+and table- and formula-only sources are used as whole crops. Targets are transcriptions of each crop produced
+by the base GLM-OCR, except for table crops from sources that ship cell-level annotations (about 39% of the
+table stream), which use the original annotations converted to the evaluation markup convention. The three
+streams — page text (6.49M), tables (2.90M), formulas (2.89M) — are predominantly English; the table and
+formula streams are each subsampled once with a fixed seed to 2.16M for a 60/20/20 ratio, giving the 10.8M
+globally shuffled training set.
 
 ## Citation
 
 ```bibtex
 @techreport{gravityocr2026,
-  title  = {Diffusion Drafts, AR Verifies: Lossless Parallel Decoding for Document OCR},
+  title  = {Diffusion Drafts, AR Verifies: Accelerating Document OCR with Self-Speculative Decoding},
   author = {Trillion Labs},
   year   = {2026}
 }
