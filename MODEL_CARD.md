@@ -75,8 +75,9 @@ out = model.generate(**inputs, max_new_tokens=4096, do_sample=False)
 print(processor.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True))
 ```
 
-Prompts follow GLM-OCR: `Text Recognition:`, `Table Recognition:` (HTML), `Formula Recognition:` (LaTeX),
-one layout region per request, as in the GLM-OCR SDK.
+Prompts follow GLM-OCR: `Text Recognition:`, `Table Recognition:` (HTML), `Formula Recognition:` (LaTeX).
+The model reads one layout region per request — full pages go through a layout detector first, as in the
+GLM-OCR SDK. Fine-tuning was predominantly English; Chinese works at the base model's level.
 
 ### Self-speculative decoding — the point of the model
 
@@ -100,25 +101,8 @@ Both are written out step by step in the repository's [`AGENTS.md`](https://gith
 
 ## Training
 
-1. **Joint AR + block-diffusion fine-tuning** of GLM-OCR: 40k steps, ~26B tokens, 16×H100, DeepSpeed
-   ZeRO-2 bf16, block size 32, vision-encoder LR ×0.1, AR loss weight 1.0. Vision is never noised.
-2. **GRPO on the AR path** (TRL) from the 40k checkpoint: edit-distance / TEDS / CDM rewards with
-   structure penalties and scorer-identical markup normalization; lr 3e-6, 28 generations per prompt,
-   KL β=1e-3, token-level truncated importance sampling. This checkpoint is step 500 of that run.
-
-**Data.** A pool of 12.3M region-level examples assembled from predominantly public data (DocGenome,
-Docmatix, PubTables-1M, FinTabNet, SynthTabNet, PubTabNet, RVL-CDIP, DocLayNet, and the training split of
-UniMER) — layout regions cropped from full pages at native resolution, with targets transcribed by the base
-GLM-OCR except for table crops from sources with cell-level annotations (about 39% of the table stream).
-The table and formula streams are subsampled to a 60/20/20 stream ratio, giving a 10.8M training set,
-predominantly English.
-
-## Intended use and limitations
-
-Document image → text / HTML / LaTeX transcription of layout regions (full-page use goes through a layout
-detector, as in GLM-OCR). Training data is predominantly English; Chinese is supported by the base model but
-under-represented in fine-tuning. Verification guarantees the output equals the AR path's greedy output — it
-does not make the AR path more accurate than it is.
+Fine-tuned from GLM-OCR with joint autoregressive + block-diffusion training on the same weights, then GRPO on
+the AR path. The recipe and the data are described in the tech report.
 
 ## Citation
 
