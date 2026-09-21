@@ -99,11 +99,6 @@ Both are written out step by step in the repository's [`AGENTS.md`](https://gith
   ```
   `bd_size` — block size the model was trained with (serve with the same value) · `mask_id` — the `<|mask|>` token used for drafting · `ar_loss_weight > 0` — the checkpoint has a trained AR path and can verify its own drafts.
 
-## Training
-
-Fine-tuned from GLM-OCR with joint autoregressive + block-diffusion training on the same weights, then GRPO on
-the AR path. The recipe and the data are described in the tech report.
-
 ## Citation
 
 ```bibtex
