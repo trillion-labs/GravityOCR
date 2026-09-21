@@ -14,54 +14,48 @@ tags:
 - glm-ocr
 ---
 
+<div align="center">
+
 # GravityOCR
 
-**Diffusion drafts, AR verifies — accelerating document OCR with self-speculative decoding.**
+**Diffusion Drafts, AR Verifies: Accelerating Document OCR with Self-Speculative Decoding**
 
-GravityOCR is [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR) (CogViT vision encoder + 0.5B
-text decoder) jointly fine-tuned with a block-diffusion objective and an autoregressive objective on
-the *same* weights. At inference the diffusion path drafts a block of tokens in parallel and the AR
-path verifies them, so decoding advances several tokens per forward pass while producing exactly the
-AR-greedy output. The released checkpoint is additionally trained with GRPO on the AR path using
-sequence- and structure-level OCR rewards.
+[![Code](https://img.shields.io/badge/GitHub-trillion--labs%2FGravityOCR-181717?logo=github)](https://github.com/trillion-labs/GravityOCR)
+[![Tech Report](https://img.shields.io/badge/Tech%20Report-PDF-B31B1B?logo=adobeacrobatreader&logoColor=white)](https://github.com/trillion-labs/GravityOCR/releases)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](https://github.com/trillion-labs/GravityOCR/blob/main/LICENSE)
 
-| Model | Decode | OmniDocBench v1.6 Overall ↑ | tokens / forward | pages/s ↑ |
+One set of weights drafts a whole block of tokens with block diffusion and verifies it with its own
+autoregressive path — the AR output, several tokens per forward pass.
+
+</div>
+
+<p align="center"><img src="assets/teaser.png" width="88%" alt="OmniDocBench Overall vs. pages per second"></p>
+
+<p align="center"><sub>OmniDocBench v1.6 Overall vs. single-stream page rate on one H100 — every system measured on the same boundary.</sub></p>
+
+## Results
+
+OmniDocBench v1.6, official protocol. Speed: SGLang, one H100, batch size 1.
+
+| Model | Decode | Overall ↑ | Tokens / forward ↑ | Pages / s ↑ |
 |---|---|---|---|---|
 | GLM-OCR (base) | AR | 95.48 | 1.0 | 0.571 |
 | GravityOCR | AR | 95.16 | 1.0 | 0.554 |
-| **GravityOCR** | **self-speculative** | **95.16** | **9.7** | **0.730** (1.32× the AR path) |
+| **GravityOCR** | **self-speculative** | **95.16** | **9.7** | **0.730** |
 
-The two GravityOCR rows score the same because they produce the same text. On region crops the gain is
-3.94× on decode alone and 1.74× end to end.
+- **1.32×** more pages per second than the AR path, identical output → same score.
+- On region crops: **3.94×** decode-only, **1.74×** end to end.
+- Under bf16 serving kernels the two paths agree exactly on 96.6% of crops; the rest are floating-point tie-breaks.
 
-![One page, AR vs self-speculative, at measured speed](assets/page_race.gif)
+## See it decode
 
-*One OmniDocBench page, both sides at their measured per-region times (one H100, slowed 6.3×).*
+<p align="center"><img src="assets/page_race.gif" width="100%" alt="One page, AR vs self-speculative, at measured speed"></p>
 
-Speed: SGLang serving, one H100, batch size 1, measured at the HTTP boundary. Score: official OmniDocBench protocol
-and aggregation. Paper: *Diffusion Drafts, AR Verifies: Accelerating Document OCR with Self-Speculative Decoding*
-(Trillion Labs, 2026). Code, serving patch and evaluation protocol:
-[github.com/trillion-labs/GravityOCR](https://github.com/trillion-labs/GravityOCR).
+<p align="center"><sub>One OmniDocBench page, both sides at their measured per-region times (one H100, slowed 6.3×).</sub></p>
 
-## What is in this repository
+## Use
 
-A standard `GlmOcrForConditionalGeneration` checkpoint (`model.safetensors`, bf16, 2.2 GB) with its
-processor/tokenizer, plus `block_diffusion.json`:
-
-```json
-{"bd_size": 32, "mask_id": 59282, "ar_loss_weight": 1.0, "mask_schedule": "uniform", ...}
-```
-
-- `bd_size` — diffusion block size the model was trained with (serve with the same value).
-- `mask_id` — the `<|mask|>` token id used for diffusion drafting.
-- `ar_loss_weight > 0` — the checkpoint has a trained AR path and can therefore verify its own drafts.
-
-The architecture and prompt format are unchanged from GLM-OCR, so the model is a drop-in replacement
-for it in any AR pipeline.
-
-## Usage
-
-### Plain autoregressive decoding (stock `transformers`)
+### Autoregressive decoding — stock `transformers`, nothing else needed
 
 ```python
 from transformers import AutoProcessor, GlmOcrForConditionalGeneration
@@ -80,29 +74,39 @@ inputs = processor.apply_chat_template(messages, add_generation_prompt=True, tok
 out = model.generate(**inputs, max_new_tokens=4096, do_sample=False)
 print(processor.decode(out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True))
 ```
-Prompts follow GLM-OCR: `Text Recognition:`, `Table Recognition:` (HTML output), `Formula Recognition:`
-(LaTeX output), applied per layout region as in the GLM-OCR SDK.
 
-### Self-speculative decoding (the point of this model)
+Prompts follow GLM-OCR: `Text Recognition:`, `Table Recognition:` (HTML), `Formula Recognition:` (LaTeX),
+one layout region per request, as in the GLM-OCR SDK.
 
-Same weights, ~9.7 tokens committed per forward pass, output identical to the AR path above.
+### Self-speculative decoding — the point of the model
 
-- **Serving:** SGLang v0.5.12 with the patch in the code repository (`patches/sglang/`), then
-  `bash serve/serve_sglang_ocr.sh MODE=spec CKPT=trillionlabs/GravityOCR` — an OpenAI-compatible
-  endpoint. `MODE=ar` serves the same checkpoint autoregressively for a direct comparison.
-- **In-process:** `python src/infer_omnidocbench.py --checkpoint trillionlabs/GravityOCR --spec_natcache ...`
-  from the code repository.
+Needs the [code repository](https://github.com/trillion-labs/GravityOCR); same weights, same output, ~9.7 tokens per forward pass.
 
-## Training summary
+- **Serve:** SGLang v0.5.12 + `patches/sglang/`, then `bash serve/serve_sglang_ocr.sh MODE=spec CKPT=trillionlabs/GravityOCR` — an OpenAI-compatible endpoint (`MODE=ar` serves the same checkpoint autoregressively for a direct comparison).
+- **In process:** `python src/infer_omnidocbench.py --checkpoint trillionlabs/GravityOCR --spec_natcache ...`
+
+Both are written out step by step in the repository's [`AGENTS.md`](https://github.com/trillion-labs/GravityOCR/blob/main/AGENTS.md).
+
+## Model details
+
+- **Architecture:** `GlmOcrForConditionalGeneration` — CogViT vision encoder + 0.5B text decoder, unchanged from
+  [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR), so the checkpoint is a drop-in replacement in any AR pipeline.
+- **Files:** `model.safetensors` (bf16, 2.2 GB), processor and tokenizer, and `block_diffusion.json`:
+
+  ```json
+  {"bd_size": 32, "mask_id": 59282, "ar_loss_weight": 1.0, "mask_schedule": "uniform", ...}
+  ```
+  `bd_size` — block size the model was trained with (serve with the same value) · `mask_id` — the `<|mask|>` token used for drafting · `ar_loss_weight > 0` — the checkpoint has a trained AR path and can verify its own drafts.
+
+## Training
 
 1. **Joint AR + block-diffusion fine-tuning** of GLM-OCR: 40k steps, ~26B tokens, 16×H100, DeepSpeed
-   ZeRO-2 bf16, block size 32, block-phase jitter, vision-encoder LR ×0.1, AR loss weight 1.0.
-   Vision is never noised.
+   ZeRO-2 bf16, block size 32, vision-encoder LR ×0.1, AR loss weight 1.0. Vision is never noised.
 2. **GRPO on the AR path** (TRL) from the 40k checkpoint: edit-distance / TEDS / CDM rewards with
    structure penalties and scorer-identical markup normalization; lr 3e-6, 28 generations per prompt,
-   KL β=1e-3, token-level truncated importance sampling. This card's checkpoint is step 500 of that run.
+   KL β=1e-3, token-level truncated importance sampling. This checkpoint is step 500 of that run.
 
-Training data: a pool of 12.3M region-level examples assembled from predominantly public data (DocGenome,
+**Data.** A pool of 12.3M region-level examples assembled from predominantly public data (DocGenome,
 Docmatix, PubTables-1M, FinTabNet, SynthTabNet, PubTabNet, RVL-CDIP, DocLayNet, and the training split of
 UniMER) — layout regions cropped from full pages at native resolution, with targets transcribed by the base
 GLM-OCR except for table crops from sources with cell-level annotations (about 39% of the table stream).
@@ -111,14 +115,10 @@ predominantly English.
 
 ## Intended use and limitations
 
-Document image → text/HTML/LaTeX transcription of layout regions (full-page use goes through a
-layout detector, as in GLM-OCR). Training data is predominantly English; Chinese is supported by the
-base model but under-represented in fine-tuning. Verification guarantees the output equals the AR
-path's greedy output — it does not make the AR path more accurate than it is.
-
-## License
-
-MIT, inheriting GLM-OCR's MIT license.
+Document image → text / HTML / LaTeX transcription of layout regions (full-page use goes through a layout
+detector, as in GLM-OCR). Training data is predominantly English; Chinese is supported by the base model but
+under-represented in fine-tuning. Verification guarantees the output equals the AR path's greedy output — it
+does not make the AR path more accurate than it is.
 
 ## Citation
 
@@ -129,3 +129,7 @@ MIT, inheriting GLM-OCR's MIT license.
   year   = {2026}
 }
 ```
+
+## License
+
+MIT, inheriting GLM-OCR's MIT license.
