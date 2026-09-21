@@ -16,7 +16,7 @@ step. Hand it to your coding agent or follow it yourself.
 
 </div>
 
-<p align="center"><img src="assets/teaser.png" width="88%" alt="OmniDocBench Overall vs. pages per second"></p>
+<p align="center"><img src="assets/teaser.svg" width="88%" alt="OmniDocBench Overall vs. pages per second"></p>
 
 <p align="center"><sub>OmniDocBench v1.6 Overall vs. single-stream page rate on one H100 — every system measured on the same boundary.</sub></p>
 
