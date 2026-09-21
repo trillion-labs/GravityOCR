@@ -6,11 +6,13 @@
 
 [![Tech Report](https://img.shields.io/badge/Tech%20Report-PDF-B31B1B?logo=adobeacrobatreader&logoColor=white)](https://github.com/trillion-labs/GravityOCR/releases)
 [![Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-GravityOCR-FFD21E)](https://huggingface.co/trillionlabs/GravityOCR)
-[![Base model](https://img.shields.io/badge/base-GLM--OCR-2A78D6)](https://huggingface.co/zai-org/GLM-OCR)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 One set of weights drafts a whole block of tokens with block diffusion and verifies it with its own
 autoregressive path — the AR output, several tokens per forward pass.
+
+**To run it, open [`AGENTS.md`](AGENTS.md)** — setup, serving, in-process inference and evaluation, step by
+step. Hand it to your coding agent or follow it yourself.
 
 </div>
 
@@ -22,7 +24,7 @@ autoregressive path — the AR output, several tokens per forward pass.
 
 <p align="center"><img src="assets/page_race.gif" width="100%" alt="One page, AR vs self-speculative, at measured speed"></p>
 
-<p align="center"><sub>One OmniDocBench page, seven regions, same weights. Both panels play at their <b>measured</b> per-region times (one H100, SGLang, batch size 1), slowed 6.3× so you can watch. Self-speculative decoding finishes the page in 1.06 s and 124 forward passes; autoregressive needs 2.86 s and 1,844.</sub></p>
+<p align="center"><sub>One OmniDocBench page, seven regions, same weights. Both panels play at their <b>measured</b> per-region times — vision encoding, prefill and decoding through the SGLang server on one H100, batch size 1; layout detection not included — slowed 6.3× so you can watch. Self-speculative decoding finishes the page in 1.06 s and 124 forward passes; autoregressive needs 2.86 s and 1,844.</sub></p>
 
 ## How it works
 
@@ -66,8 +68,7 @@ model = GlmOcrForConditionalGeneration.from_pretrained("trillionlabs/GravityOCR"
 
 Self-speculative decoding — the point of the model — needs this repository: **serve it with the SGLang
 patch** (`patches/sglang/`, OpenAI-compatible endpoint) or **run it in process** (`src/infer_omnidocbench.py --spec_natcache`).
-Setup, serving, in-process inference and OmniDocBench evaluation are written out step by step in
-**[`AGENTS.md`](AGENTS.md)** — hand that file to your coding agent, or follow it yourself.
+Both are written out in [`AGENTS.md`](AGENTS.md).
 
 - **Weights:** [`trillionlabs/GravityOCR`](https://huggingface.co/trillionlabs/GravityOCR) — a standard
   `GlmOcrForConditionalGeneration` checkpoint plus `block_diffusion.json` (`bd_size`, `mask_id`, `ar_loss_weight`).
