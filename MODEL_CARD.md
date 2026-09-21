@@ -34,11 +34,11 @@ sequence- and structure-level OCR rewards.
 The two GravityOCR rows score the same because they produce the same text. On region crops the gain is
 3.94× on decode alone and 1.74× end to end.
 
-![AR vs self-speculative decoding](assets/ar_vs_selfspec.gif)
+![One page, AR vs self-speculative, at measured speed](assets/page_race.gif)
 
-*The same weights decoding the same crop: autoregressive on the left, self-speculative on the right.
-Forward counts as measured — 150 against 10 — with the right panel played at one-quarter of the left
-panel's wall time rather than at the raw forward ratio.*
+*One OmniDocBench page, seven regions, same weights. Both panels play at their measured per-region times
+(one H100, SGLang, batch size 1), slowed 6.3×. Self-speculative decoding finishes the page in 1.06 s and
+124 forward passes; autoregressive needs 2.86 s and 1,844.*
 
 Speed: SGLang serving, one H100, batch size 1, measured at the HTTP boundary. Score: official OmniDocBench protocol
 and aggregation. Paper: *Diffusion Drafts, AR Verifies: Accelerating Document OCR with Self-Speculative Decoding*
