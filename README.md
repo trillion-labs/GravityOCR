@@ -10,7 +10,7 @@ itself. In exact arithmetic the output *is* the AR greedy output — the model o
 
 *Left: autoregressive decoding, one token per forward. Right: the same weights decoding the same crop
 self-speculatively. The forward counts are the measured ones — 150 against 10 — while the right panel is
-played at one-seventh of the left panel's wall time rather than at the raw forward ratio, since a block
+played at one-fifth of the left panel's wall time rather than at the raw forward ratio, since a block
 forward costs more than a single-token forward.*
 
 ## How it works
