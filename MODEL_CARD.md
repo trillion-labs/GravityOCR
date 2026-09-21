@@ -36,10 +36,7 @@ The two GravityOCR rows score the same because they produce the same text. On re
 
 ![One page, AR vs self-speculative, at measured speed](assets/page_race.gif)
 
-*One OmniDocBench page, seven regions, same weights. Both panels play at their measured per-region times
-(vision encoding + prefill + decoding through the SGLang server, one H100, batch size 1; layout detection
-not included), slowed 6.3×. Self-speculative decoding finishes the page in 1.06 s and 124 forward passes;
-autoregressive needs 2.86 s and 1,844.*
+*One OmniDocBench page, both sides at their measured per-region times (one H100, slowed 6.3×).*
 
 Speed: SGLang serving, one H100, batch size 1, measured at the HTTP boundary. Score: official OmniDocBench protocol
 and aggregation. Paper: *Diffusion Drafts, AR Verifies: Accelerating Document OCR with Self-Speculative Decoding*

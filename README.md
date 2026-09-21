@@ -18,13 +18,11 @@ step. Hand it to your coding agent or follow it yourself.
 
 <p align="center"><img src="assets/teaser.png" width="88%" alt="OmniDocBench Overall vs. pages per second"></p>
 
-<p align="center"><sub>OmniDocBench v1.6 Overall against single-stream page rate on one H100, every system measured by us on the same boundary. GravityOCR keeps the base model's accuracy and is the fastest.</sub></p>
+<p align="center"><sub>OmniDocBench v1.6 Overall vs. single-stream page rate on one H100 — every system measured on the same boundary.</sub></p>
 
 ## See it decode
 
 <p align="center"><img src="assets/page_race.gif" width="100%" alt="One page, AR vs self-speculative, at measured speed"></p>
-
-<p align="center"><sub>One OmniDocBench page, seven regions, same weights. Both panels play at their <b>measured</b> per-region times — vision encoding, prefill and decoding through the SGLang server on one H100, batch size 1; layout detection not included — slowed 6.3× so you can watch. Self-speculative decoding finishes the page in 1.06 s and 124 forward passes; autoregressive needs 2.86 s and 1,844.</sub></p>
 
 ## How it works
 
