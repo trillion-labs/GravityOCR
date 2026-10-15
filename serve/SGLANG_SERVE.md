@@ -17,6 +17,17 @@ Multi-GPU data parallel: `DP=8 GPU=0,1,2,3,4,5,6,7`. Batch cap for spec mode: `M
 Draft window: `DRAFT=33` is the default (K = training block size 32 + the boundary token; see
 `docs/SGLANG_SELFSPEC_IMPL.md` §9-2) — override only for K sweeps, output is identical for any K.
 
+**Optimized runtime: `FAST=1` is the default.** It turns on the runtime optimizations shipped in the SGLang patch
+(`docs/SGLANG_SELFSPEC_IMPL.md` §7-5): in both modes the GLM ViT runs as CUDA graphs captured per patch count up to
+2048, pixel values cross process boundaries as bf16, the server's CPU ops run single-threaded and two tokenizer
+worker processes preprocess regions in parallel; in spec mode additionally the mask-free attention path, the M-RoPE
+cache fix, the GPU-side commit, host-side lengths, device-side positions and the draft launched ahead of the host
+bookkeeping. The output is bit-identical to `FAST=0`, which serves the unoptimized runtime. Any single flag can be
+overridden from the environment (e.g. `SELFSPEC_DRAFT_AHEAD=0`), and `EXTRA_ARGS` is appended to `launch_server`.
+The ViT graphs lengthen startup and take a few GB of GPU memory away from the KV cache. Spec mode also sets
+`SELFSPEC_POS_OFFSET=1` (the positions GLM-OCR checkpoints are served with) and, when `CKPT` has no local
+`block_diffusion.json` (e.g. a hub id), `SELFSPEC_MASK_ID=59282` (`docs/SGLANG_SELFSPEC_IMPL.md` §9-1, §10).
+
 The launcher bakes in the gotchas that each cost a debugging cycle:
 1. **venv bin on PATH** — flashinfer cuda-graph capture shells out to `ninja`; missing → capture dies with
    `FileNotFoundError: ninja`. Use `$VBIN/python` directly, not `uv run`, which may pick a different venv.
@@ -65,8 +76,14 @@ OpenAI-compatible endpoint with one identical client, so engines (this server in
 
 ## 5. Where the time goes (for optimization work)
 
-Both AR and spec are host/launch-bound on a 0.9B model even with cuda graphs. A spec round is two
-block forwards (draft + verify) plus a small amount of accept/mask bookkeeping; the two forwards are
-dispatched serially (CPU dispatch → wait for GPU). Overlapping the host-side orchestration with GPU
-compute is the main remaining lever for latency; multi-GPU data parallelism is the lever for aggregate
-throughput. Removing the verify mask is not (it breaks losslessness under cuda graphs).
+On a 0.9B model both AR and spec are host/launch-bound even with cuda graphs: a spec round is two block forwards
+(draft + verify) plus accept/commit bookkeeping, and the unoptimized runtime spends more of a round in host work —
+mask construction and copies, blocking device↔host copies, per-token Python bookkeeping, vision preprocessing — than
+in GPU compute. `FAST=1` removes most of it, bit-identically: the verify and draft masks are gone (built-in FlashInfer
+mask modes), a blocking copy per forward is gone (M-RoPE cache fix), the commit is one kernel plus one readback, and
+the next round's draft is launched before the current round's host bookkeeping so that bookkeeping runs under GPU
+time. Multi-GPU data parallelism is the lever for aggregate throughput.
+
+The older `SELFSPEC_NOMASK=1` path is a different experiment and stays off: a dual-graph mask-free path that read a
+stale captured mask buffer under cuda graphs and broke losslessness. The `FAST=1` attention path does not share that
+mechanism (`docs/SGLANG_SELFSPEC_IMPL.md` §7-1).

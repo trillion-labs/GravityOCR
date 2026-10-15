@@ -12,7 +12,7 @@ src/            model + decoders (models/glm_ocr_dllm.py, fast_sampling.py, fast
                 infer_omnidocbench.py, infer_odb_ar.py, layout_postprocess.py)
 scripts/        eval.sh (+ _lib.sh) — the evaluation launcher; it records every run into runs/<name>/
 serve/          SGLang self-spec server (serve_sglang_ocr.sh) and the vLLM AR baseline (launch_vllm.sh, vllm_throughput.py)
-patches/sglang/ the SGLang diff + the new worker file that implement self-speculative decoding
+patches/sglang/ the SGLang diff + the new files that implement self-speculative decoding
 slurm/          the four slurm recipes: OmniDocBench inference (diffusion / AR), scoring, tok/fwd bench
 tools/          6 measurement utilities: bench_forwards.py (tokens/forward), measure_tps_fair.py, http_ocr_throughput.py,
                 precompute_odb_layout.py, score_breakdown.py, unimer_cdm.py
@@ -48,7 +48,7 @@ uv sync                          # inference env (pyproject.toml, torch 2.9.1+cu
 git clone https://github.com/sgl-project/sglang $SGLANG_SRC && cd $SGLANG_SRC
 git checkout $(cut -c1-40 $DOCR_ROOT/patches/sglang/sglang_BASE_COMMIT.txt)          # v0.5.12 base commit
 git apply $DOCR_ROOT/patches/sglang/sglang_0.5.12_selfspec.patch
-cp -r $DOCR_ROOT/patches/sglang/python .                                            # the new worker file
+cp -r $DOCR_ROOT/patches/sglang/python .                                            # the new files
 uv venv .venv-sglang --python 3.12 && uv pip install --python .venv-sglang/bin/python -r $DOCR_ROOT/env/sglang_venv_freeze.txt -e $SGLANG_SRC/python
 
 # serve (MODE=spec = self-speculative, MODE=ar = plain autoregressive, same weights)

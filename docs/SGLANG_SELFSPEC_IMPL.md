@@ -8,10 +8,18 @@ Shipped artifacts — `patches/sglang/`
 | file | content |
 |---|---|
 | `sglang_BASE_COMMIT.txt` | upstream SGLang commit the patch applies to (`1519acf`, v0.5.12) |
-| `sglang_0.5.12_selfspec.patch` | changes to 18 existing source files plus `python/pyproject.toml` — `git apply` |
+| `sglang_0.5.12_selfspec.patch` | changes to 24 existing source files plus `python/pyproject.toml` — `git apply` |
 | `python/sglang/srt/speculative/selfspec_diffusion_worker.py` | the new worker (the core of the implementation) |
+| `python/sglang/srt/speculative/selfspec_fast_attn.py` | mask-free draft / verify attention planning for FlashInfer (`SELFSPEC_FASTATTN`, §7-1) |
+| `python/sglang/srt/speculative/selfspec_fast_commit.py` | GPU-side commit + single-readback host bookkeeping (`SELFSPEC_FAST_COMMIT`, §7-5) |
+| `python/sglang/srt/multimodal/glm_vit_graph_runner.py` | CUDA graphs for the GLM-OCR vision encoder (`SS_GLM_VIT_GRAPH_MAXM`, §7-5) |
 
-Check: `base + patch + new file == our working tree` was verified with `git apply --check --reverse`.
+The three files after the worker implement runtime optimizations only (§7-5). They are imported unconditionally but
+act only under their environment flags, which are off in the code; the output with them on is bit-identical to the
+output with them off.
+
+Check: applying the patch and copying the new files onto a clean checkout of the base commit reproduces our source tree
+file for file.
 
 ---
 
@@ -106,19 +114,25 @@ With `next = i+1, sibling = -1` the `verify_tree_greedy` kernel degenerates from
 
 ```bash
 git clone https://github.com/sgl-project/sglang.git && cd sglang
-git checkout $(cat $DOCR_ROOT/patches/sglang/sglang_BASE_COMMIT.txt | cut -c1-40)
+git checkout $(grep -oE '[0-9a-f]{40}' $DOCR_ROOT/patches/sglang/sglang_BASE_COMMIT.txt | head -1)
 git apply $DOCR_ROOT/patches/sglang/sglang_0.5.12_selfspec.patch
-cp -r $DOCR_ROOT/patches/sglang/python .          # adds speculative/selfspec_diffusion_worker.py
+cp -r $DOCR_ROOT/patches/sglang/python .          # adds the four new files (table above)
 ```
 ```bash
+SELFSPEC_POS_OFFSET=1 \
 python -m sglang.launch_server --model-path $CKPT --trust-remote-code \
   --speculative-algorithm SELFSPEC_DIFFUSION \
   --speculative-num-draft-tokens 33 \
   --page-size 1 \
   --attention-backend flashinfer --mem-fraction-static 0.6 --context-length 8192
 ```
-The launcher with every gotcha baked in is `serve/serve_sglang_ocr.sh` (`MODE=spec|ar`).
 The same engine is also usable through SGLang's Python `Engine` API with these arguments.
+
+`$CKPT` is a checkpoint directory with `block_diffusion.json`, which supplies the mask id; for a hub id also set
+`SELFSPEC_MASK_ID=59282` (§9-1). `SELFSPEC_POS_OFFSET=1` gives the positions GLM-OCR checkpoints are served with (§10).
+This command runs the unoptimized runtime; the optimized one adds the flags of §7-5.
+The launcher with every gotcha baked in is `serve/serve_sglang_ocr.sh` (`MODE=spec|ar`); its `FAST=1` default turns
+the §7-5 flags on, and `FAST=0` serves the unoptimized runtime.
 
 ---
 
@@ -137,7 +151,8 @@ class SelfSpecDiffusionWorker:
         self.model_config    = target_worker.model_config    # the framework reads it from the worker
         self.draft_token_num = server_args.speculative_num_draft_tokens   # = K
         dllm_cfg = DllmConfig.from_server_args(server_args)
-        self.mask_id = dllm_cfg.mask_id if dllm_cfg is not None else 59282   # <- §9-1
+        # SELFSPEC_MASK_ID > <model_path>/block_diffusion.json > --dllm-algorithm config > error   <- §9-1
+        self.mask_id, self._bd_size, _ = _resolve_block_diffusion(server_args, dllm_cfg)
 ```
 
 ### 5-2. Prefill branch — planting the seed
@@ -186,6 +201,8 @@ if self._fulldraft:
     self._last_dK = am[:, K - 1]              # d_{K-1}: the last mask's logit, consumed by the full-draft verify
 ```
 Viewing `logits` as `[bs, n, V]` requires the model to return logits at **every** position → §6-1.
+With `SELFSPEC_FASTATTN=1` the worker builds no mask (`mask = None`) and tags the forward with
+`spec.selfspec_role = "draft"` (`"verify"` in §5-4) instead; the attention backend derives the same pattern (§7-1).
 
 ### 5-4. VERIFY — full-draft round (`SELFSPEC_FULLDRAFT=1`, default)
 The verify window is `[a0, d_1..d_{K-1}]`: the boundary token x0 is **not** re-forwarded. Its KV slot from
@@ -262,16 +279,18 @@ Finally restore `batch.forward_mode = ForwardMode.DECODE`.
 
 ---
 
-## 6. The 18 modified files — what, why, and what is model-specific
+## 6. The 24 modified files — what, why, and what is model-specific
 
 ### 6-1. Model side (MUST be adapted to your model)
 
-**`models/glm4v.py`** — logits at every position. Without this there is no draft.
+**`models/glm4v.py`, `models/glm_ocr.py`** — logits at every position. Without this there is no draft.
 ```python
 self.logits_processor = LogitsProcessor(config, return_full_logits=True)
 ```
 
-**`dllm/config.py`** — architecture registration; the single most model-specific line of the change.
+**`dllm/config.py`** — architecture registration (block size and mask id). The self-spec worker reads it only when
+`--dllm-algorithm` is passed; otherwise the mask id comes from `SELFSPEC_MASK_ID` or the checkpoint's
+`block_diffusion.json` (§9-1).
 ```python
 "GlmOcrForConditionalGeneration": {"block_size": 32, "mask_id": 59282},
 ```
@@ -335,8 +354,29 @@ Without it the scheduler can admit a batch whose verify allocation then fails un
 `custom_mask=None` (otherwise the constructor raises `AttributeError` and the scheduler dies); caching
 `accept_length_cpu` (one D2H per round saved).
 
-### 6-3. Do not port
-The profiling / dump blocks (`DLLM_PROF`, `SELFSPEC_*_DUMP`, `SELFSPEC_TIME`, `SELFSPEC_NOSYNC`), and the
+**`speculative/eagle_draft_cuda_graph_runner.py`** — keeps the stock EAGLE draft graph runner working with the
+patched `CudaGraphRunner.capture` signature (the graph-runner changes themselves are §7).
+
+### 6-3. Runtime optimizations (optional; §7-5)
+Each lever is gated by its own flag, off in the code; skip all of them for a first port and add them once Gate 1
+(§11) passes on the plain runtime.
+
+| lever | files |
+|---|---|
+| `SELFSPEC_FASTATTN` | `speculative/selfspec_fast_attn.py` (new), `layers/attention/flashinfer_backend.py` (per-role planning, the draft's causal re-run), `model_executor/cuda_graph_runner.py` (graphs keyed by (bs, role)) |
+| `SELFSPEC_MROPE_FIX` | `model_executor/forward_batch_info.py`, `model_executor/model_runner.py`, `model_executor/cuda_graph_runner.py` |
+| `SELFSPEC_FAST_COMMIT` / `_HOSTLEN` / `_DEV_POS` | `speculative/selfspec_fast_commit.py` (new), the worker, `managers/schedule_batch.py`, `managers/scheduler_output_processor_mixin.py`, `managers/utils.py` (host token lists + `finish_checked` on `GenerationBatchResult`) |
+| `SELFSPEC_DRAFT_AHEAD` | the worker, `managers/scheduler.py` (binding, release before prefill admission and `pause_generation`), `managers/scheduler_update_weights_mixin.py` (release before weight updates) |
+| `SS_GLM_VIT_GRAPH_MAXM` | `multimodal/glm_vit_graph_runner.py` (new), `models/glm_ocr.py`, `layers/attention/vision.py` |
+| `SS_GLM_PV_BF16` | `multimodal/processors/glm4v.py`, `multimodal/processors/base_processor.py` |
+
+What is model-specific: the ViT graphs and bf16 pixels are written for the GLM-OCR vision encoder and processor, and
+the M-RoPE fix matters only for M-RoPE models. The attention, commit and draft-ahead levers are model-independent but
+tied to FlashInfer (§7-5).
+
+### 6-4. Do not port
+The profiling / dump blocks (`DLLM_PROF`, `SELFSPEC_*_DUMP`, `SELFSPEC_TIME`, `SELFSPEC_NOSYNC`, `DUMP_POS` in
+`models/glm4v.py`), the decode-latency fields added in `managers/tokenizer_manager.py`, and the
 `seq_lens_cpu` wiring in `flashinfer_backend.py` (§7-4). The `dllm/mixin/*`, `schedule_policy.py` and
 `radix_cache.py` changes belong to an older experimental path gated on `req.dllm_config`; they are
 inactive with `--speculative-algorithm SELFSPEC_DIFFUSION` and can be dropped.
@@ -345,15 +385,35 @@ inactive with `--speculative-algorithm SELFSPEC_DIFFUSION` and can be dropped.
 
 ## 7. cuda graphs and attention — how it actually runs
 
-### 7-1. The default path uses masks and ONE graph per batch size
-The direction of draft (bidirectional) and verify (causal) is expressed by the **contents of
-`custom_mask`**. flashinfer runs in `MaskMode.CUSTOM`, the real mask is copied into the buffer at replay,
-so one graph per bs handles both. This is the verified path (`SELFSPEC_MASK=1`, default).
+### 7-1. Two attention paths: mask-free (served) and custom mask (reference)
+Draft and verify are both `TARGET_VERIFY` forwards of K tokens per request; only the attention pattern differs.
 
-> The tree also contains a complete dual-graph (`(bs, causal)` key) implementation for `SELFSPEC_NOMASK=1`.
-> It is OFF by default and the worker comments record that it measured worse on both correctness and
-> speed: combined with cuda graphs it read a stale captured mask buffer and 7 of 12 pages diverged from
-> AR. When porting, use the default mask path only.
+**Mask-free path — `SELFSPEC_FASTATTN=1`** (what the launcher runs with `FAST=1`, its default). No mask tensor is
+built, copied or packed. The worker tags each forward with a role and the FlashInfer backend expresses the pattern
+with built-in mask modes over the unchanged request layout (one request per sequence):
+- verify runs `CAUSAL`. FlashInfer aligns a causal mask bottom-right, so row i sees the prefix plus window rows
+  0..i — exactly all-ones prefix ++ `tril(K, K)`;
+- draft runs the same plan `NON_CAUSAL` (the mask rows see prefix + seed + all masks), then once more `CAUSAL`;
+  row 0 of that second run (the seed: prefix + seed only) replaces row 0.
+
+`speculative/selfspec_fast_attn.py` plans FlashInfer directly from lengths the host already knows, and the graph
+runner captures one graph per (bs, role). The output is bit-identical to the mask path: the plan and tile
+configuration are the ones the custom mask uses, so every row reads the same KV chunks in the same merge order and
+masked keys contribute the same exact zeros (compared with the mask path call by call, `SELFSPEC_SHADOW=1`).
+Cheaper ways to get the seed row — a second sub-request in the same call, or its own one-row call — change
+FlashInfer's KV splitting and are not bit-identical; the second causal run is what keeps row 0 exact.
+Requirements: `--attention-backend flashinfer`, flashinfer 0.6.7.post2 with the fa2 prefill backend (the path calls
+FlashInfer's planner directly; both are checked at startup), no `--enable-dp-attention`.
+
+**Custom-mask path — `SELFSPEC_FASTATTN=0`** (the code default; what `FAST=0` runs). The direction of draft
+(bidirectional) and verify (causal) is expressed by the **contents of `custom_mask`**. flashinfer runs in
+`MaskMode.CUSTOM`, the real mask is copied into the buffer at replay, so one graph per bs handles both
+(`SELFSPEC_MASK=1`, default). This is the reference the mask-free path is checked against; port it first.
+
+> The tree also contains an older dual-graph (`(bs, causal)` key) implementation for `SELFSPEC_NOMASK=1`. It is a
+> different, failed experiment, not the mask-free path above. It is OFF by default and recorded as worse on both
+> correctness and speed: combined with cuda graphs it read a stale captured mask buffer and its output diverged from
+> AR. It is refused at startup together with `SELFSPEC_FASTATTN=1` or the full-draft round. When porting, do not use it.
 
 ### 7-2. draft and verify share KV slots
 Previously draft allocated → cloned → freed and verify allocated again. Sharing makes `kv_indices`
@@ -378,6 +438,10 @@ the ragged path and needs `or self.selfspec_nomask` there too.** `dllm_ragged_ca
 attribute on `ForwardBatch` (read with `getattr(..., False)` everywhere), so a typo passes silently —
 declare it as a dataclass field when porting.
 
+The mask-free path of §7-1 does not use this route: the role on `spec_info` selects the planner's per-role wrapper and
+sets the causal flag in the forward metadata. Its wrappers are paged for every model, so the paged/ragged gating above
+does not apply to it.
+
 ### 7-4. cuda-graph lessons (do not repeat)
 1. `causal` is a Python scalar and is baked into the graph at capture → N modes = N graphs.
 2. flashinfer's mask mode is decided by whether a buffer was passed to the **constructor**; it cannot be
@@ -386,11 +450,52 @@ declare it as a dataclass field when porting.
    identical pages when tried on the mask path).
 4. **The eager fallback must be the return value of `can_run()`.** Nothing in SGLang reads
    `batch.can_run_cuda_graph`; a guard placed there was a no-op and the crash stayed exposed.
-5. `custom_mask` has `sum_req K*(seq_len+K)` elements and **grows with the context**. Overflowing the cuda
-   graph's fixed buffer kills the server with an illegal memory access at replay → route only the
-   overflowing batches to eager in `can_run`.
+5. On the mask path, `custom_mask` has `sum_req K*(seq_len+K)` elements and **grows with the context**. Overflowing
+   the cuda graph's fixed buffer kills the server with an illegal memory access at replay → route only the
+   overflowing batches to eager in `can_run`. (The mask-free path has no mask buffer to overflow.)
 6. Multimodal prefill must run eager. The vision encoder / `input_embeds` scatter is not in the graph;
    replaying an image-less graph for an image prefill fails with a gather index out of bounds.
+
+### 7-5. Runtime optimizations (`FAST=1`)
+At this model size the unoptimized runtime is bound by host work — kernel launches, blocking copies, Python
+bookkeeping — rather than by GPU compute, in AR and spec mode alike. The levers below remove that work. Each one is
+off in the code and gated by its own flag, and each produces bit-identical output to the unoptimized runtime (the
+same token ids in AR and spec mode). `serve/serve_sglang_ocr.sh` turns all of them on with `FAST=1`, its default;
+`FAST=0` serves the unoptimized runtime. Flags and defaults: §10.
+
+- **Mask-free attention** (`SELFSPEC_FASTATTN=1`) — §7-1. Removes mask construction, the mask copy and its packing
+  from every forward; FlashInfer is planned from host-known lengths without a device→host copy; one cuda graph per
+  (bs, role).
+- **M-RoPE delta cache fix** (`SELFSPEC_MROPE_FIX=1`) — the draft/verify M-RoPE positions add a per-request delta
+  that SGLang caches on the device, but the cache check compared the device string `"cuda"` with `cuda:0` and always
+  missed, so every forward did a blocking host→device copy that waited for the queued GPU work. The fix caches the
+  delta per batch composition and builds the positions in one kernel; it also reads the per-round switches once.
+- **GPU commit** (`SELFSPEC_FAST_COMMIT=1`, `SELFSPEC_HOSTLEN=1`, `SELFSPEC_DEV_POS=1`;
+  `speculative/selfspec_fast_commit.py`) — one kernel commits the accepted tokens (next seed, sequence lengths,
+  rejected KV slots); the host finishes the round — output ids, finish checks with the per-token loop's exact
+  semantics, KV accounting — from one pinned readback plus one event sync. Sequence lengths are kept exact on the
+  host, and window positions are computed on the GPU. All three need `SELFSPEC_FASTATTN=1`; `FAST_COMMIT` also needs
+  the full-draft round.
+- **Draft ahead** (`SELFSPEC_DRAFT_AHEAD=1`) — right after round t's readback, when no request can finish in this
+  round, round t+1's draft is launched first, and round t's host bookkeeping and the scheduler's output processing
+  run under its GPU time. The next call uses the pre-launched draft only if the batch is unchanged; otherwise its KV
+  slots are freed and a fresh draft runs. A pre-launched draft is also released before a prefill admission, a weight
+  update or `pause_generation`. Rounds with logprobs, hidden states, a grammar or a custom logit processor, and
+  outputs carrying `customized_info`, run without it. Needs the four flags above (startup error otherwise); it
+  switches itself off with a warning under `--dllm-algorithm`, disaggregation, the prefill delayer, `pp_size > 1`,
+  `tp_size > 1` or n-gram embeddings.
+- **ViT CUDA graphs** (`SS_GLM_VIT_GRAPH_MAXM=<M>`, the launcher uses 2048; `multimodal/glm_vit_graph_runner.py`) —
+  the GLM-OCR vision encoder is captured at startup as one CUDA graph per patch count up to M and replayed for a
+  single image of a captured size; other calls run eager. Every captured size is compared with the eager forward at
+  capture (`SS_GLM_VIT_GRAPH_CHECK`, default 1) and falls back to eager on a mismatch. Needs the FA3 vision attention
+  backend (SGLang's default on Hopper; otherwise it switches itself off). Cost: longer startup and a few GB of GPU
+  memory, taken from the KV cache.
+- **bf16 pixels** (`SS_GLM_PV_BF16=1`) — the processor casts `pixel_values` to bf16 on the GPU, halving the bytes
+  moved through D2H, shared memory, zmq and H2D. The values are unchanged: the model casts them to bf16 anyway
+  (bf16 models only).
+- **Server level** — `--tokenizer-worker-num 2` preprocesses regions in parallel processes, and
+  `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `TORCH_NUM_THREADS=1` inside the server stop image preprocessing from
+  oversubscribing every core.
 
 ---
 
@@ -426,21 +531,27 @@ the fixed vision + prefill cost dominates short outputs. Never compare numbers a
 ## 9. Porting traps
 
 ### 9-1. A silently wrong mask_id — the most dangerous
-SGLang does **not** read `block_diffusion.json`. There are two mask_id paths:
-- `--dllm-algorithm` given → a `DllmConfig` is built and reads the arch map in `dllm/config.py`.
-- not given → `DllmConfig.from_server_args` returns `None` → the worker's hard-coded fallback `59282`.
-  **Our launchers use this path** (`serve_sglang_ocr.sh` and `trl_sglang_server.py` do not pass it).
+A wrong mask id does not crash: verification keeps the output correct and only acceptance collapses, which is
+hard to diagnose. The worker therefore resolves the mask id at startup in this order, with no silent fallback:
+1. `SELFSPEC_MASK_ID` (environment);
+2. `<model_path>/block_diffusion.json` — its `mask_id`, plus `bd_size` when present. Only a local checkpoint
+   directory has this file; a hub id does not;
+3. the `--dllm-algorithm` config (`DllmConfig`, i.e. the architecture map in `dllm/config.py`);
+4. none of these → startup error.
 
-Serving another model as-is therefore drafts with someone else's mask token; verification keeps the
-output correct and only acceptance collapses, which is hard to diagnose.
-→ Change the fallback constant in `selfspec_diffusion_worker.py` to your model's value, or register the
-architecture and pass `--dllm-algorithm`. Check the startup line `[selfspec-diffusion] K=.. mask_id=..`.
+A mask id outside the vocabulary is also a startup error. When `bd_size` is known and `--speculative-num-draft-tokens`
+is not `bd_size + 1`, the worker logs a warning and still runs (§9-2). Our launcher relies on (2) for a checkpoint
+directory and sets `SELFSPEC_MASK_ID=59282` (GLM-OCR's `<|mask|>`) only when `CKPT` has no local
+`block_diffusion.json`, e.g. a hub id.
+→ When porting, ship `block_diffusion.json` (`mask_id`, `bd_size`) with your checkpoint or set `SELFSPEC_MASK_ID`, and
+check the startup line `[selfspec-diffusion] K=.. mask_id=.. (from ..) bd_size=..`, which names where the id came from.
 
 ### 9-2. K = training block + 1
 With a fully masked training block of `bd_size=32` and a token-shift loss, each mask attends to **32
 masks** in training. The inference window `[seed | MASK x (K-1)]` has K-1 masks → **K = bd_size + 1 = 33**
 is aligned. K=33 gives consistently (slightly) higher tok/fwd than K=32; K larger than the training
-block is still lossless but acceptance saturates.
+block is still lossless but acceptance saturates. When `block_diffusion.json` gives `bd_size`, the worker warns at
+startup if K ≠ `bd_size + 1`.
 
 ### 9-3. window length ≠ engine K kills the kernel
 ```
@@ -454,7 +565,8 @@ The KV advance is partial (accept length), which misaligns with pages larger tha
 also asserts `page_size == 1` (it writes its one new slot into `req_to_token` directly).
 
 ### 9-5. No overlap scheduler
-Blocked explicitly in `spec_info.py`; `server_args` forces `disable_overlap_schedule=True`.
+Blocked explicitly in `spec_info.py`; `server_args` forces `disable_overlap_schedule=True`. Host/GPU overlap
+comes from inside the worker instead (`SELFSPEC_DRAFT_AHEAD`, §7-5).
 
 ### 9-6. temp > 0 uses a separate verify path
 `verify()` branches on `sampling_info.is_all_greedy`: greedy → `_greedy_verify`; temp > 0 →
@@ -481,26 +593,48 @@ export PATH=<venv>/bin:$PATH           # cuda-graph capture shells out to ninja
 
 ## 10. Environment variables
 
-Reproduce this combination first: `SELFSPEC_FULLDRAFT=1` (default), `SELFSPEC_MASK=1` (default),
-`SELFSPEC_NOMASK=0`, `SELFSPEC_EXACT_PENALTY=0`, cuda graphs ON.
+Reproduce this combination first (the unoptimized runtime, `FAST=0`): `SELFSPEC_FULLDRAFT=1` (default),
+`SELFSPEC_MASK=1` (default), `SELFSPEC_NOMASK=0`, `SELFSPEC_EXACT_PENALTY=0`, cuda graphs ON. Then add the
+runtime optimizations (§7-5); the output must not change.
 
 | env | default | purpose |
 |---|---|---|
 | `SELFSPEC_FULLDRAFT` | `1` | full-draft round (§2): every mask logit + the bonus token, up to K+1 tokens per round. `0` = legacy round (≤ K) |
-| `SELFSPEC_MASK` | `1` | verify with custom_mask. **The verified path; leave on** |
-| `SELFSPEC_NOMASK` | `0` | mask-free + dual graph. Measured worse (correctness and speed) — experimental |
-| `SELFSPEC_TRAIN_MASKS` | `0` | window K+1. Kills the kernel (§9-3) |
+| `SELFSPEC_MASK_ID` | unset | mask token id; takes precedence over `block_diffusion.json` and `--dllm-algorithm` (§9-1) |
+| `SELFSPEC_POS_OFFSET` | `0` | constant added to the window's positions. `0` = AR-aligned (x0 at the position AR decoding gives that token). GLM-OCR checkpoints are served with `1`, the positions the released numbers were produced with; the launcher sets it in spec mode |
+| `SELFSPEC_MASK` | `1` | custom-mask path: verify with custom_mask. **The reference path**; ignored when `SELFSPEC_FASTATTN=1` |
+| `SELFSPEC_FASTATTN` | `0` | mask-free draft/verify attention, one cuda graph per (bs, role) (§7-1). flashinfer backend only |
+| `SELFSPEC_MROPE_FIX` | `0` | fixes the M-RoPE delta cache that always missed (removes a blocking copy per forward); reads the per-round switches once (§7-5) |
+| `SELFSPEC_FAST_COMMIT` | `0` | commit on the GPU, host bookkeeping from one pinned readback (§7-5). Needs `SELFSPEC_FASTATTN=1`, `SELFSPEC_FULLDRAFT=1` |
+| `SELFSPEC_HOSTLEN` | `0` | sequence lengths kept exact on the host (no device→host sum). Needs `SELFSPEC_FASTATTN=1` |
+| `SELFSPEC_DEV_POS` | `0` | window positions computed on the GPU. Needs `SELFSPEC_FASTATTN=1` |
+| `SELFSPEC_DRAFT_AHEAD` | `0` | launch the next round's draft before this round's host bookkeeping (§7-5). Needs the four flags above |
+| `SS_GLM_VIT_GRAPH_MAXM` | `0` (off) | GLM-OCR ViT as one CUDA graph per patch count up to this value; other sizes run eager (§7-5) |
+| `SS_GLM_VIT_GRAPH_CHECK` | `1` | compare every captured ViT graph with the eager forward at capture; a mismatching size runs eager |
+| `SS_GLM_PV_BF16` | `0` | the processor casts `pixel_values` to bf16 on the GPU (bf16 models only) |
+| `SELFSPEC_CHECK` | `0` | diagnostic: per-forward host/device length, position and plan checks; raises on a mismatch (syncs; never time with it) |
+| `SELFSPEC_SHADOW` | `0` | diagnostic, with `SELFSPEC_FASTATTN=1`, eager forwards only: also run the mask path and compare every attention call bitwise |
+| `SELFSPEC_PADFIX` | `1` | custom-mask path only: pad the mask for the dummy rows of a padded graph replay |
+| `SELFSPEC_NOMASK` | `0` | older mask-free dual-graph path, not `SELFSPEC_FASTATTN`. Measured worse (correctness and speed) — experimental; refused with `SELFSPEC_FASTATTN=1` or `SELFSPEC_FULLDRAFT=1` |
+| `SELFSPEC_TRAIN_MASKS` | `0` | window K+1. Kills the kernel (§9-3); refused at startup with `SELFSPEC_FASTATTN=1` |
 | `SELFSPEC_EXACT_PENALTY` | `0` | exact AR match when repetition_penalty is used (§9-7) |
 | `SGLANG_NGRAM_FORCE_GREEDY_VERIFY` | `0` | force greedy verify even at temp > 0 (A/B) |
 | `SELFSPEC_DEBUG` | `0` | per-round accept + cumulative tok/fwd |
 | `SELFSPEC_TIME` / `SELFSPEC_NOSYNC` | `0` | per-phase timers / launch-bound diagnosis |
 | `SELFSPEC_ACCEPT_STATS` | `""` | path → per-position confidence + accept as jsonl |
 | `SELFSPEC_ROUND_HIST` | `0` | histogram of tokens committed per round, printed every 200 rounds |
-| `SELFSPEC_POS_OFFSET` | `0` | experimental: constant added to the window's 1-D positions (see the worker comment) |
 | `SELFSPEC_{LOGIT,DRAFT,VERIFY}_DUMP` | `0` | dump the first rounds |
 | `DLLM_PROF` / `DLLM_GRAPH_DBG` | `0` | forward / graph instrumentation |
 
 Capture, runtime and backend must read the **same** flag; splitting it in two was a real bug.
+
+The launcher sets these through one knob. `FAST=1` (default) exports, in spec mode, `SELFSPEC_FASTATTN`,
+`SELFSPEC_MROPE_FIX`, `SELFSPEC_FAST_COMMIT`, `SELFSPEC_HOSTLEN`, `SELFSPEC_DEV_POS` and `SELFSPEC_DRAFT_AHEAD` = `1`, and
+in both modes `SS_GLM_VIT_GRAPH_MAXM=2048`, `SS_GLM_PV_BF16=1`, `OMP_NUM_THREADS` / `MKL_NUM_THREADS` /
+`TORCH_NUM_THREADS` = `1` (`OMP_NUM_THREADS_SERVER` overrides the value) and `--tokenizer-worker-num 2`
+(`TOKENIZER_WORKERS`). `FAST=0` exports none of them. A `SELFSPEC_*` / `SS_*` flag already set in the environment
+wins, and `EXTRA_ARGS` is appended to `launch_server`. In spec mode the launcher also exports `SELFSPEC_FULLDRAFT=1`
+and `SELFSPEC_POS_OFFSET=1`, and `SELFSPEC_MASK_ID=59282` when `CKPT` has no local `block_diffusion.json`.
 
 ---
 
@@ -510,7 +644,8 @@ Separate correctness from speed; mixing them hides the cause.
 
 1. **Gate 1 — output equals AR.** Run the same prompts with `MODE=ar` and `MODE=spec` and compare
    **token ids** (text comparison is confounded by re-tokenization). On a mismatch check the penalty
-   (§9-7) and whether the mask path is on (§7-1).
+   (§9-7) and whether the mask path is on (§7-1). Pass it with `FAST=0` first, then again with the §7-5 flags on;
+   `SELFSPEC_CHECK=1` and `SELFSPEC_SHADOW=1` localize a mismatch on the optimized path.
 2. **Gate 2 — acceptance is real.** `SELFSPEC_DEBUG=1` prints per-round accept. Values stuck at 1–2
    mean the draft is garbage: mask_id (§9-1) or K alignment (§9-2).
 3. **Gate 3 — speed.** Only then measure tok/fwd and tok/s.

@@ -1,5 +1,5 @@
 diff --git a/python/pyproject.toml b/python/pyproject.toml
-index d388d27..b87dce0 100755
+index d388d275de0275553439edda3feec259a625c232..b87dce0fc9b9477838d3ab0733cf9716b6ab4bbe 100755
 --- a/python/pyproject.toml
 +++ b/python/pyproject.toml
 @@ -64,9 +64,9 @@ dependencies = [
@@ -15,7 +15,7 @@ index d388d27..b87dce0 100755
    "torchvision",
    "tqdm",
 diff --git a/python/sglang/srt/dllm/config.py b/python/sglang/srt/dllm/config.py
-index edd2049..720b0d0 100644
+index edd2049268ac56a9f6ccff16b78bb9ea22c90d0e..720b0d0e5a4fc5e5a147644a7aff0120265eb836 100644
 --- a/python/sglang/srt/dllm/config.py
 +++ b/python/sglang/srt/dllm/config.py
 @@ -35,6 +35,7 @@ class DllmConfig:
@@ -27,7 +27,7 @@ index edd2049..720b0d0 100644
  
          arch = model_config.hf_config.architectures[0]
 diff --git a/python/sglang/srt/dllm/mixin/req.py b/python/sglang/srt/dllm/mixin/req.py
-index 720b9d1..88c07ad 100644
+index 720b9d1db162fcef48eee7e0e4593cd6bb008084..88c07ad244a82c8f7657946be47e46351cc12af0 100644
 --- a/python/sglang/srt/dllm/mixin/req.py
 +++ b/python/sglang/srt/dllm/mixin/req.py
 @@ -67,8 +67,9 @@ class ReqDllmMixin:
@@ -44,7 +44,7 @@ index 720b9d1..88c07ad 100644
          if prefix_len > self.dllm_block_offset:
              self.dllm_block_offset = prefix_len
 diff --git a/python/sglang/srt/dllm/mixin/scheduler.py b/python/sglang/srt/dllm/mixin/scheduler.py
-index 3524d40..4097c1f 100644
+index 3524d40aa0daf456582a8076f9e3f48265b50c9e..4097c1f6319725226719bcf0792c8ed0a91ed619 100644
 --- a/python/sglang/srt/dllm/mixin/scheduler.py
 +++ b/python/sglang/srt/dllm/mixin/scheduler.py
 @@ -1,8 +1,11 @@
@@ -94,10 +94,37 @@ index 3524d40..4097c1f 100644
                      req.time_stats.set_completion_time()
  
 diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
-index 4fe8aec..4155ffb 100644
+index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d2644d021 100644
 --- a/python/sglang/srt/layers/attention/flashinfer_backend.py
 +++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
-@@ -137,6 +137,19 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -16,6 +16,10 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
+ 
+ import torch
+ 
++# Split-KV control for self-spec verify/draft plans (see call_begin_forward).
++_SELFSPEC_VERIFY_NO_SPLIT = os.environ.get("SELFSPEC_VERIFY_NO_SPLIT", "0") == "1"
++_SELFSPEC_VERIFY_FIXED_SPLIT = int(os.environ.get("SELFSPEC_VERIFY_FIXED_SPLIT", "0") or 0)
++
+ from sglang.kernel_api_logging import debug_kernel_api
+ from sglang.srt.compilation.piecewise_context_manager import (
+     get_forward_context,
+@@ -104,6 +108,15 @@ class PrefillMetadata:
+     use_ragged: bool
+     extend_no_prefix: bool
+     multi_item_params: Optional[MultiItemScoringParams] = None
++    # SELFSPEC_FASTATTN: causal flag of the paged forward (draft False / verify True); None = unchanged
++    ss_causal: Optional[bool] = None
++    # draft only: after the NON_CAUSAL run, run the same plan CAUSAL and copy its row 0 of each K-row window (the seed
++    # row: prefix + seed only) into the output (speculative/selfspec_fast_attn.py)
++    ss_seed_causal: bool = False
++    ss_K: int = 0
++    # SELFSPEC_SHADOW=1 (diagnostic, eager only): the old custom-mask wrapper planned for the same forward; forward_extend
++    # compares the fast-path output with it bitwise (speculative/selfspec_fast_attn.py shadow_record)
++    ss_shadow: Optional[object] = None
+ 
+ 
+ # Reuse this workspace buffer across all flashinfer wrappers
+@@ -137,6 +150,27 @@ class FlashInferAttnBackend(AttentionBackend):
          # FIXME: remove dllm workarounds from flashinfer
          self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
          self.is_dllm_model = self.dllm_config is not None
@@ -114,10 +141,77 @@ index 4fe8aec..4155ffb 100644
 +            and model_runner.spec_algorithm.is_selfspec_diffusion()
 +        )
 +        self.selfspec_nomask = self.is_selfspec and os.environ.get("SELFSPEC_NOMASK", "0") == "1"
++        # SELFSPEC_FASTATTN=1: mask-free + sync-free draft/verify attention (speculative/selfspec_fast_attn.py).
++        # Built after the wrappers/updaters below (needs indices_updater_prefill); default OFF = the old custom-mask path unchanged.
++        from sglang.srt.speculative.selfspec_fast_attn import fastattn_enabled as _ss_fastattn_enabled
++
++        self.selfspec_fast = bool(self.is_selfspec and _ss_fastattn_enabled() and not skip_prefill)
++        if self.selfspec_fast and self.selfspec_nomask:
++            raise ValueError("SELFSPEC_FASTATTN=1 and SELFSPEC_NOMASK=1 are mutually exclusive")
++        self.ss_planner = None
  
          # Parse constants
          self.decode_use_tensor_cores = should_use_tensor_core(
-@@ -608,8 +621,19 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -305,6 +339,17 @@ class FlashInferAttnBackend(AttentionBackend):
+         self.prefill_cuda_graph_metadata = {}  # For verify
+         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+ 
++        if self.selfspec_fast:
++            from sglang.srt.speculative.selfspec_fast_attn import SelfSpecFastPlanner
++
++            self.ss_planner = SelfSpecFastPlanner(self, model_runner)
++
++    def _ss_role(self, spec_info):
++        """self-spec role ('draft' / 'verify') of a TARGET_VERIFY forward when the fast path is on, else None (old path)."""
++        if self.ss_planner is None or spec_info is None:
++            return None
++        return getattr(spec_info, "selfspec_role", None)
++
+     def _process_multi_item_scoring(
+         self, forward_batch: ForwardBatch
+     ) -> MultiItemScoringParams:
+@@ -456,6 +501,30 @@ class FlashInferAttnBackend(AttentionBackend):
+             self.forward_metadata = PrefillMetadata(
+                 self.prefill_wrappers_paged, False, False
+             )
++        elif forward_batch.forward_mode.is_target_verify() and self._ss_role(forward_batch.spec_info) is not None:
++            self.forward_metadata = self.ss_planner.plan_eager(self._ss_role(forward_batch.spec_info), forward_batch)
++            _shm = getattr(forward_batch.spec_info, "ss_shadow_mask", None) if self.ss_planner.shadow else None
++            if _shm is not None:
++                # SELFSPEC_SHADOW=1: plan the OLD path exactly as the branch below does, with the worker's old custom
++                # mask swapped in for this call (the fast-path spec_info carries custom_mask None)
++                _spec = forward_batch.spec_info
++                _keep = _spec.custom_mask
++                _spec.custom_mask = _shm
++                try:
++                    self.indices_updater_prefill.update(
++                        forward_batch.req_pool_indices,
++                        forward_batch.seq_lens,
++                        forward_batch.seq_lens_cpu,
++                        forward_batch.seq_lens_sum,
++                        prefix_lens=None,
++                        prefill_wrappers=self.prefill_wrappers_verify,
++                        use_ragged=False,
++                        encoder_lens=forward_batch.encoder_lens,
++                        spec_info=_spec,
++                    )
++                finally:
++                    _spec.custom_mask = _keep
++                self.forward_metadata.ss_shadow = self.prefill_wrappers_verify[0]
+         elif forward_batch.forward_mode.is_target_verify():
+             self.indices_updater_prefill.update(
+                 forward_batch.req_pool_indices,
+@@ -595,6 +664,9 @@ class FlashInferAttnBackend(AttentionBackend):
+                 decode_wrappers[i].begin_forward = partial(
+                     fast_decode_plan, decode_wrappers[i]
+                 )
++        elif forward_mode.is_target_verify() and self._ss_role(spec_info) is not None:
++            # SELFSPEC_FASTATTN: one wrapper per (bs, role) with the role's own metadata buffers / int workspace (no shared plan info)
++            self.forward_metadata = self.ss_planner.capture(self._ss_role(spec_info), bs, req_pool_indices, seq_lens)
+         elif forward_mode.is_target_verify():
+             prefill_wrappers = []
+             for i in range(self.num_wrappers):
+@@ -608,8 +680,19 @@ class FlashInferAttnBackend(AttentionBackend):
                          paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                          paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                          paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
@@ -127,7 +221,7 @@ index 4fe8aec..4155ffb 100644
 +                        # `if self._custom_mask_buf is not None: mask_mode = CUSTOM` inside run(), and that
 +                        # decision is baked into the graph at capture time. A buffer given to the
 +                        # constructor therefore pins CUSTOM mode even when plan(custom_mask=None) is called,
-+                        # and the kernel reads a stale buffer — exactly why an earlier mask-removal attempt broke.
++                        # and the kernel reads a stale buffer.
 +                        **(
 +                            {}
 +                            if self.selfspec_nomask
@@ -139,7 +233,19 @@ index 4fe8aec..4155ffb 100644
                      )
                  )
              seq_lens_sum = seq_lens.sum().item()
-@@ -783,10 +807,19 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -711,6 +794,11 @@ class FlashInferAttnBackend(AttentionBackend):
+                 fixed_split_size=None,
+                 disable_split_kv=self.disable_cuda_graph_kv_split,
+             )
++        elif forward_mode.is_target_verify() and self._ss_role(spec_info) is not None:
++            self.forward_metadata = self.ss_planner.plan_replay(
++                self._ss_role(spec_info), bs, req_pool_indices[:bs], seq_lens[:bs],
++                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
++            )
+         elif forward_mode.is_target_verify():
+             self.indices_updater_prefill.update(
+                 req_pool_indices[:bs],
+@@ -783,10 +871,24 @@ class FlashInferAttnBackend(AttentionBackend):
                          layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                      )
  
@@ -151,6 +257,11 @@ index 4fe8aec..4155ffb 100644
 +            paged_causal = not layer.is_cross_attention
 +            if self.is_dllm_model or self.selfspec_nomask:
 +                paged_causal = bool(getattr(forward_batch, "dllm_ragged_causal", False))
++            # SELFSPEC_FASTATTN: verify = CAUSAL; draft = NON_CAUSAL here (mask rows), then the same plan CAUSAL below with
++            # its row 0 (seed) copied into row 0. One request per sequence, as before; the wrapper has no custom mask.
++            _ssc = getattr(self.forward_metadata, "ss_causal", None)
++            if _ssc is not None:
++                paged_causal = _ssc
 +
              o = prefill_wrapper_paged.forward(
                  q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -160,7 +271,47 @@ index 4fe8aec..4155ffb 100644
                  sm_scale=layer.scaling,
                  # Disable sliding window attention for multi-item scoring:
                  # - Sliding window could cut across item boundaries, breaking semantic coherence
-@@ -823,6 +856,12 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -807,6 +909,39 @@ class FlashInferAttnBackend(AttentionBackend):
+                 k_scale=layer.k_scale_float,
+                 v_scale=layer.v_scale_float,
+             )
++            # SELFSPEC_FASTATTN draft: the NON_CAUSAL run above is right for the mask rows; the seed row (row 0 of every
++            # K-row window) must see prefix + seed only -> run the same plan CAUSAL (row 0's causal view is exactly that) and copy it.
++            if getattr(self.forward_metadata, "ss_seed_causal", False):
++                _K = self.forward_metadata.ss_K
++                o_c = prefill_wrapper_paged.forward(
++                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
++                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
++                    causal=True,
++                    sm_scale=layer.scaling,
++                    window_left=layer.sliding_window_size,
++                    logits_soft_cap=logits_soft_cap,
++                    k_scale=layer.k_scale_float,
++                    v_scale=layer.v_scale_float,
++                )
++                _o4 = o.view(-1, _K, layer.tp_q_head_num, layer.head_dim)
++                _o4[:, 0].copy_(o_c.view(-1, _K, layer.tp_q_head_num, layer.head_dim)[:, 0])
++            _shw = getattr(self.forward_metadata, "ss_shadow", None)
++            if _shw is not None:
++                # SELFSPEC_SHADOW=1: the old custom-mask path on the same q / KV (MaskMode kCustom: the wrapper was planned
++                # with the worker's old mask, so the causal flag is ignored exactly as in the old path)
++                o_old = _shw.forward(
++                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
++                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
++                    causal=not layer.is_cross_attention,
++                    sm_scale=layer.scaling,
++                    window_left=layer.sliding_window_size,
++                    logits_soft_cap=logits_soft_cap,
++                    k_scale=layer.k_scale_float,
++                    v_scale=layer.v_scale_float,
++                )
++                self.ss_planner.shadow_record(
++                    "draft" if self.forward_metadata.ss_seed_causal else "verify", layer.layer_id, forward_batch.batch_size, o, o_old
++                )
+         else:
+             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
+             # `forward_batch.token_to_kv_pool` for this layer. This enables attention over
+@@ -823,6 +958,12 @@ class FlashInferAttnBackend(AttentionBackend):
                  causal = False
              if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                  save_kv_cache = False
@@ -173,7 +324,7 @@ index 4fe8aec..4155ffb 100644
  
              if self.forward_metadata.extend_no_prefix:
                  # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
-@@ -1267,6 +1306,7 @@ class FlashInferIndicesUpdaterPrefill:
+@@ -1267,6 +1408,7 @@ class FlashInferIndicesUpdaterPrefill:
              self.qo_indptr[0],
              use_ragged,
              spec_info,
@@ -181,7 +332,7 @@ index 4fe8aec..4155ffb 100644
              fixed_split_size=fixed_split_size,
              multi_item_params=multi_item_params,
          )
-@@ -1379,6 +1419,7 @@ class FlashInferIndicesUpdaterPrefill:
+@@ -1379,6 +1521,7 @@ class FlashInferIndicesUpdaterPrefill:
          use_sliding_window_kv_pool: bool = False,
          fixed_split_size: Optional[int] = None,
          multi_item_params: Optional[MultiItemScoringParams] = None,
@@ -189,21 +340,73 @@ index 4fe8aec..4155ffb 100644
      ):
          bs = len(seq_lens)
          if spec_info is None:
-@@ -1490,6 +1531,12 @@ class FlashInferIndicesUpdaterPrefill:
+@@ -1490,6 +1633,11 @@ class FlashInferIndicesUpdaterPrefill:
              token_pos_in_items_len = 0
              max_item_len_ptr = None
  
-+        # [tried, abandoned] skipping the two blocking D2H copies in plan() (paged_kv_indptr /
-+        # last_page_len .to("cpu")) via the max_sequence_kv argument is blocked by a flashinfer bug:
-+        # with that argument the paged_kv_indptr_host assignment is skipped but a later line still
-+        # references it -> UnboundLocalError. max_token_per_sequence is safe but what it saves is an
-+        # .item() on a CPU tensor (no device sync), so there is no gain.
-+        # -> removing these D2H copies needs a flashinfer patch (deferred).
++        # Note: the two blocking D2H copies in plan() (paged_kv_indptr / last_page_len .to("cpu"))
++        # cannot be skipped via the max_sequence_kv argument because of a flashinfer bug: with that
++        # argument the paged_kv_indptr_host assignment is skipped but a later line still references
++        # it -> UnboundLocalError. max_token_per_sequence is safe but only saves an .item() on a CPU
++        # tensor (no device sync), so it is not used. Removing these D2H copies needs a flashinfer patch.
          wrapper_paged.begin_forward(
              qo_indptr,
              kv_indptr,
+@@ -1503,7 +1651,15 @@ class FlashInferIndicesUpdaterPrefill:
+             kv_data_type=self.data_type,
+             custom_mask=use_custom_mask,
+             non_blocking=True,
+-            fixed_split_size=fixed_split_size,
++            # Self-spec verify/draft plans (spec_info is only set on TARGET_VERIFY here):
++            #   default: flashinfer's split heuristic; at bs=1 its KV chunk is 128 until kv ~3.3k, then grows with the
++            #     request's TOTAL kv length -> chunk boundaries (merge order) depend on where the (K+1)-token window starts,
++            #     so beyond ~3.3k a token's logits depend on the draft's accept pattern at the bf16-rounding level.
++            #   SELFSPEC_VERIFY_FIXED_SPLIT=<n>: fixed chunk n (boundaries at multiples of n, independent of window).
++            #   SELFSPEC_VERIFY_NO_SPLIT=1: no split — worse: window-dependent from early in the sequence.
++            fixed_split_size=(_SELFSPEC_VERIFY_FIXED_SPLIT if (spec_info is not None and _SELFSPEC_VERIFY_FIXED_SPLIT)
++                              else fixed_split_size),
++            disable_split_kv=bool(spec_info is not None and _SELFSPEC_VERIFY_NO_SPLIT),
+             prefix_len_ptr=prefix_len_ptr,
+             token_pos_in_items_ptr=token_pos_in_items_ptr,
+             token_pos_in_items_len=token_pos_in_items_len,
+diff --git a/python/sglang/srt/layers/attention/vision.py b/python/sglang/srt/layers/attention/vision.py
+index 3fd45aac0101cb96c892bd9137e8f83ce76695fa..36b928e79e787e37efab8f6fa04e73e28b9226ba 100644
+--- a/python/sglang/srt/layers/attention/vision.py
++++ b/python/sglang/srt/layers/attention/vision.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import dataclasses
+ import functools
+ import math
++import os
+ from functools import lru_cache, partial
+ from typing import Any, Callable, Optional, Tuple
+ 
+@@ -377,6 +378,12 @@ class VisionTritonAttention(nn.Module):
+         return output
+ 
+ 
++# With SS_GLM_VIT_GRAPH_MAXM>0 (default off) the GLM ViT passes cu_seqlens as the list [cu_gpu, max_seqlen]
++# (graph replay and its eager fallback); FA3 then takes the list path per call instead of per the global
++# SGLANG_VIT_ENABLE_CUDA_GRAPH env. Off: this bool is False and the dispatch below is the original one.
++_SS_VIT_LIST = int(os.environ.get("SS_GLM_VIT_GRAPH_MAXM", "0") or 0) > 0
++
++
+ class VisionFlash3Attention(nn.Module):
+     def __init__(
+         self,
+@@ -406,7 +413,9 @@ class VisionFlash3Attention(nn.Module):
+         Returns:
+              [b * s, h, head_size]
+         """
+-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
++        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() or (
++            _SS_VIT_LIST and isinstance(cu_seqlens, list)
++        ):
+             max_seqlen = cu_seqlens[1]
+             output = flash_attn_func(
+                 q,
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 0b26be6..3fa754e 100644
+index 0b26be6c6d180fd608492333e5f3a602d8bc1c4b..8c32ba1ee11eafb65e42006f4118b8af1dd510c7 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
 @@ -1,4 +1,5 @@
@@ -212,7 +415,18 @@ index 0b26be6..3fa754e 100644
  
  from sglang.srt.dllm.config import DllmConfig
  from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-@@ -1929,6 +1930,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -108,6 +109,10 @@ MM_PAD_SHIFT_VALUE = 1_000_000
+ 
+ logger = logging.getLogger(__name__)
+ 
++# SELFSPEC_HOSTLEN=1: filter_batch of a self-spec batch sums the host seq_lens (no .item() sync); default off.
++_SS_HOSTLEN = os.environ.get("SELFSPEC_HOSTLEN", "0") == "1"
++_SS_CHECK = os.environ.get("SELFSPEC_CHECK", "0") == "1"
++
+ 
+ @lru_cache(maxsize=1)
+ def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
+@@ -1929,6 +1934,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
              len_per_topk = ceil_align(len_per_topk, page_size)
              spec_tokens = ceil_align(spec_tokens, page_size)
  
@@ -224,8 +438,31 @@ index 0b26be6..3fa754e 100644
          num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
  
          # v2 eagle has over-allocation
+@@ -2228,7 +2238,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
+         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
+         self.out_cache_loc = None
+-        self.seq_lens_sum = self.seq_lens.sum().item()
++        if (
++            _SS_HOSTLEN
++            and self.seq_lens_cpu is not None
++            and self.spec_algorithm is not None
++            and self.spec_algorithm.is_selfspec_diffusion()
++        ):
++            # SELFSPEC_HOSTLEN=1 (self-spec only): the host lengths are exact (the self-spec worker keeps
++            # seq_lens_cpu == seq_lens; SELFSPEC_CHECK=1 asserts it every forward), so the sum needs no device->host sync
++            self.seq_lens_sum = int(self.seq_lens_cpu.sum())
++            if _SS_CHECK and self.seq_lens_sum != int(self.seq_lens.sum().item()):
++                raise RuntimeError(
++                    f"[selfspec-check] filter_batch: host seq_lens_sum {self.seq_lens_sum} != device {int(self.seq_lens.sum().item())}"
++                )
++        else:
++            self.seq_lens_sum = self.seq_lens.sum().item()
+ 
+         if self.output_ids is not None:
+             self.output_ids = self.output_ids[keep_indices_device]
 diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
-index 2cce306..f7e9781 100644
+index 2cce30600ab2108c04fb80623813c129d0a0281e..c18b5e6ee1f3f92f5dd7422bfd5890c5032fbce5 100644
 --- a/python/sglang/srt/managers/schedule_policy.py
 +++ b/python/sglang/srt/managers/schedule_policy.py
 @@ -546,15 +546,38 @@ class PrefillAdder:
@@ -237,7 +474,7 @@ index 2cce306..f7e9781 100644
 +        # PREFILL: the prompt is plain causal context (the algorithm runs the prefill forward with
 +        # dllm_ragged_causal=True), so process the WHOLE remaining prompt in ONE forward, capped only
 +        # by the chunked-prefill / memory budget. The old `min(rem_dllm_tokens, block_size)` capped
-+        # prefill at block_size too -> a 3840-token prompt took ~120 eager forwards (~2s) AND re-ran
++        # prefill at block_size too -> a 3840-token prompt took ~120 eager forwards AND re-ran
 +        # the vision encoder per chunk. The trailing decode masks are excluded (only origin+output is
 +        # causal); processing the full prompt at once also makes the first decode block start==0.
 +        if not req.is_dllm_prefill():
@@ -288,10 +525,21 @@ index 2cce306..f7e9781 100644
          if _rem_tokens <= 0:
              return AddReqResult.NO_TOKEN
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 67af2d0..b6d72d5 100644
+index 67af2d0de9436b00d33ed05e76723aaac0ae0739..9690b51440f4ac6b585cb96fa997064302e15a5a 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -984,7 +984,11 @@ class Scheduler(
+@@ -627,6 +627,10 @@ class Scheduler(
+ 
+         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
+         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
++        if getattr(self.draft_worker, "ss_draft_ahead", False):
++            # SELFSPEC_DRAFT_AHEAD=1 (self-spec only): the worker reads the waiting queue / chunked request (read
++            # only) to decide whether to launch the next round's draft ahead of the output processing
++            self.draft_worker.ss_bind_scheduler(self)
+ 
+     def init_model_worker(self):
+         self.init_tp_model_worker()
+@@ -984,7 +988,11 @@ class Scheduler(
              self.server_args.disaggregation_transfer_backend
          )
  
@@ -304,8 +552,97 @@ index 67af2d0..b6d72d5 100644
              draft_token_to_kv_pool = None
          elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
              if self.server_args.enable_multi_layer_eagle:
+@@ -2374,6 +2382,11 @@ class Scheduler(
+             if dynamic_size is not None:
+                 chunked_prefill_size = dynamic_size
+ 
++        if self.draft_worker is not None and getattr(self.draft_worker, "ss_draft_ahead", False):
++            # SELFSPEC_DRAFT_AHEAD=1: free a pre-launched self-spec draft's KV slots before the admission reads the
++            # pool, so admission (and any eviction) sees exactly the memory of the non-pipelined round
++            self.draft_worker.ss_release_stash("prefill admission")
++
+         # Prefill policy
+         adder = PrefillAdder(
+             self.page_size,
+@@ -3258,7 +3271,13 @@ class Scheduler(
+     def _pause_engine(self) -> Tuple[List[Req], int]:
+         raise NotImplementedError()
+ 
++    def ss_release_draft_ahead(self, reason: str):
++        # SELFSPEC_DRAFT_AHEAD=1: a pre-launched self-spec draft must not survive a weight update or a pause
++        if getattr(self.draft_worker, "ss_draft_ahead", False):
++            self.draft_worker.ss_release_stash(reason)
++
+     def pause_generation(self, recv_req: PauseGenerationReqInput):
++        self.ss_release_draft_ahead("pause_generation")
+         self._engine_paused = True
+ 
+         if recv_req.mode == "in_place":
+diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+index 496cd96656e59ce436eceb1a05c6bb68d6da56c9..5fe3314cf5f4d1098ffe5b7629753a0af8b6f7a3 100644
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -406,6 +406,10 @@ class SchedulerOutputProcessorMixin:
+                         v.tolist()
+                         for v in logits_output.next_token_token_ids_logprobs_val
+                     ]
++        elif result.next_token_ids_cpu is not None:
++            # self-spec SELFSPEC_FAST_COMMIT=1: the worker's one packed readback already gave the per-request
++            # host lists (the tokens appended to output_ids this round); no second device->host copy.
++            next_token_ids = result.next_token_ids_cpu
+         else:
+             # for normal spec decoding: unify next_token_ids format
+             next_token_ids = []
+@@ -459,7 +463,10 @@ class SchedulerOutputProcessorMixin:
+ 
+             req.time_stats.set_last_decode_finish_time()
+ 
+-            req.check_finished(new_accepted_len)
++            if not result.finish_checked:
++                # finish_checked (self-spec SELFSPEC_FAST_COMMIT=1): the worker ran the exact per-token finish
++                # check on every token it appended (spec v1 appends in the worker); repeating it on the last token is a no-op.
++                req.check_finished(new_accepted_len)
+ 
+             if (
+                 self.server_args.disaggregation_decode_enable_offload_kvcache
+diff --git a/python/sglang/srt/managers/scheduler_update_weights_mixin.py b/python/sglang/srt/managers/scheduler_update_weights_mixin.py
+index abcda6794674b71336f19a865f0da1b979997c67..663959874ede8e9a70d15606f2f8f11e5af24f93 100644
+--- a/python/sglang/srt/managers/scheduler_update_weights_mixin.py
++++ b/python/sglang/srt/managers/scheduler_update_weights_mixin.py
+@@ -47,6 +47,7 @@ class SchedulerUpdateWeightsMixin:
+         self: Scheduler, recv_req: UpdateWeightFromDiskReqInput
+     ):
+         """In-place update of the weights from disk."""
++        self.ss_release_draft_ahead("update_weights_from_disk")  # SELFSPEC_DRAFT_AHEAD=1
+         success, message = self.tp_worker.update_weights_from_disk(recv_req)
+         if success:
+             if recv_req.flush_cache:
+@@ -75,6 +76,7 @@ class SchedulerUpdateWeightsMixin:
+         recv_req: UpdateWeightsFromDistributedReqInput,
+     ) -> Tuple[bool, str]:
+         """Update the online model parameter."""
++        self.ss_release_draft_ahead("update_weights_from_distributed")  # SELFSPEC_DRAFT_AHEAD=1
+         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
+         if success:
+             if recv_req.flush_cache:
+@@ -88,6 +90,7 @@ class SchedulerUpdateWeightsMixin:
+         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
+     ):
+         """Update the online model parameter from tensors."""
++        self.ss_release_draft_ahead("update_weights_from_tensor")  # SELFSPEC_DRAFT_AHEAD=1
+         if recv_req.disable_draft_model:
+             worker = self.tp_worker
+         else:
+@@ -107,6 +110,7 @@ class SchedulerUpdateWeightsMixin:
+         self: Scheduler, recv_req: UpdateWeightsFromIPCReqInput
+     ):
+         """Update the online model parameter from IPC for checkpoint-engine integration."""
++        self.ss_release_draft_ahead("update_weights_from_ipc")  # SELFSPEC_DRAFT_AHEAD=1
+         success, message = self.tp_worker.update_weights_from_ipc(recv_req)
+         if success:
+             if recv_req.flush_cache:
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 8142432..566ab29 100644
+index 81424329a0c1b1470d63452ce65a120a9b639399..91967b1ab0da2b5e57467a480f0b906e7c75657a 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
 @@ -1650,6 +1650,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
@@ -328,8 +665,25 @@ index 8142432..566ab29 100644
  
                  if self.server_args.speculative_algorithm:
                      self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
+diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
+index ba777330000f86e3e8655519f47a5d4ff3049a09..ddc09c3c478edf6eff97a695bce353bf22b7ed64 100644
+--- a/python/sglang/srt/managers/utils.py
++++ b/python/sglang/srt/managers/utils.py
+@@ -49,6 +49,12 @@ class GenerationBatchResult:
+     # metrics
+     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+ 
++    # self-spec SELFSPEC_FAST_COMMIT=1 (spec v1): the tokens each request appended this round, as host lists
++    # (from the worker's one packed readback), and a flag that the worker already ran the exact per-token finish check. Default None /
++    # False = the old output processing (next_token_ids.tolist() + check_finished per request).
++    next_token_ids_cpu: Optional[List[List[int]]] = None
++    finish_checked: bool = False
++
+     def copy_to_cpu(self, return_logprob: bool):
+         """Copy tensors to CPU in overlap scheduling.
+         Only the tensors which are needed for processing results are copied,
 diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
-index 7d16160..ca9bfb5 100644
+index 7d1616037243197972caedfa74b3c5805762d1cf..ca9bfb54f9b3b8252a21d41dfa4c3f61d8fc79d8 100644
 --- a/python/sglang/srt/mem_cache/radix_cache.py
 +++ b/python/sglang/srt/mem_cache/radix_cache.py
 @@ -513,6 +513,20 @@ class RadixCache(BasePrefixCache):
@@ -354,17 +708,47 @@ index 7d16160..ca9bfb5 100644
              req.req_pool_idx, : len(token_ids)
          ]
 diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
-index c7c7d6b..4816031 100644
+index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b64cdca892 100644
 --- a/python/sglang/srt/model_executor/cuda_graph_runner.py
 +++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
-@@ -543,6 +543,21 @@ class CudaGraphRunner:
+@@ -264,6 +264,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
+         nsa_enable_prefill_cp: bool,
+         enable_num_token_non_padded_flag: bool,
+         pp_proxy_tensors: Optional[PPProxyTensors] = None,
++        mrope_rows: bool = False,
+     ):
+         if bs != raw_bs:
+             self.seq_lens.fill_(seq_len_fill_value)
+@@ -316,8 +317,19 @@ class DecodeInputBuffers(ForwardInputBuffers):
+             srcs.append(forward_batch.encoder_lens)
+ 
+         if forward_batch.mrope_positions is not None:
+-            dsts.append(self.mrope_positions[:, :raw_num_token])
+-            srcs.append(forward_batch.mrope_positions)
++            if mrope_rows and forward_batch.mrope_positions.dim() == 2:
++                # SELFSPEC_MROPE_FIX (self-spec servers only): self.mrope_positions[:, :raw_num_token] is a
++                # non-contiguous slice of the [3, max_num_token] buffer, and one non-dense tensor sends the whole (int64, int64)
++                # _foreach_copy_ group (input_ids, req_pool_indices, out_cache_loc, positions, mrope) to torch's per-tensor slow
++                # path: one cudaMemcpyAsync per contiguous tensor plus a strided copy kernel, every forward.
++                # Its rows are contiguous: copy them as 3 separate 1-D pairs, so the group stays on the fused
++                # multi-tensor kernel, as it does for models without M-RoPE. Same destination elements, same values.
++                for r in range(self.mrope_positions.shape[0]):
++                    dsts.append(self.mrope_positions[r, :raw_num_token])
++                    srcs.append(forward_batch.mrope_positions[r])
++            else:
++                dsts.append(self.mrope_positions[:, :raw_num_token])
++                srcs.append(forward_batch.mrope_positions)
+ 
+         if require_gathered_buffer:
+             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
+@@ -543,6 +555,49 @@ class CudaGraphRunner:
  
          self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
          self.is_dllm = self.dllm_config is not None
 +        # SELFSPEC, like dllm, alternates a bidirectional block draft and a causal verify, so it needs two graphs:
 +        # causal reaches wrapper.forward(causal=...) as a Python scalar and is baked into the graph at capture,
-+        # so one graph cannot serve both modes. Our launchers do not pass --dllm-algorithm, so dllm_config
-+        # is None and this path was previously unreachable (modes were distinguished by masks -> CUSTOM).
++        # so one graph cannot serve both modes. Self-spec serving does not pass --dllm-algorithm, so dllm_config
++        # is None and the dllm dual-graph path alone would not apply (modes would be distinguished by masks -> CUSTOM).
 +        self.is_selfspec = bool(
 +            getattr(model_runner, "spec_algorithm", None) is not None
 +            and model_runner.spec_algorithm.is_selfspec_diffusion()
@@ -372,14 +756,42 @@ index c7c7d6b..4816031 100644
 +        # NOTE: dual graphs only on the mask-free path. Capturing twice at the same bs overwrites
 +        # flashinfer's prefill_cuda_graph_metadata[bs] with the second wrapper set: the first graph
 +        # replays kernels bound to buffer set A while plan() updates set B ->
-+        # mismatched metadata and corrupted output (observed: the mask path regressed from 12/12 to 4/12 identical).
++        # mismatched metadata and corrupted output (observed on the mask path).
 +        self.is_dual_causal_graph = self.is_dllm or (
 +            self.is_selfspec and os.environ.get("SELFSPEC_NOMASK", "0") == "1"
 +        )
++        # SELFSPEC_FASTATTN=1: mask-free draft/verify attention -> one graph per (bs, role), each role with its
++        # own flashinfer wrapper / metadata buffers (speculative/selfspec_fast_attn.py). Default OFF = one custom-mask graph per bs.
++        # Single source of truth = the attention backend's planner (it also requires flashinfer / not skip_prefill); the worker
++        # refuses SELFSPEC_FASTATTN=1 when the backend built none, so worker, backend and graph runner always agree.
++        self.ss_fast = bool(
++            self.is_selfspec and getattr(model_runner.attn_backend, "ss_planner", None) is not None
++        )
++        if self.is_selfspec and not self.ss_fast and os.environ.get("SELFSPEC_FASTATTN", "0") == "1":
++            raise ValueError("SELFSPEC_FASTATTN=1 but the attention backend has no fast-path planner")
++        if self.ss_fast and self.is_dual_causal_graph:
++            raise ValueError("SELFSPEC_FASTATTN=1 cannot be combined with SELFSPEC_NOMASK=1 / dllm dual-causal graphs")
++        # SELFSPEC_PADFIX (old custom-mask path only): pad the mask for the dummy rows of a padded replay (out-of-bounds mask read).
++        # Default 1: a bug fix touching only dummy rows; SELFSPEC_PADFIX=0 restores the unpadded behavior exactly.
++        # The fast path has no mask, so it is moot there.
++        self.ss_padfix = bool(self.is_selfspec and not self.ss_fast and os.environ.get("SELFSPEC_PADFIX", "1") == "1")
++        # An IDLE forward (DP attention only) has no role; the fast path's graphs are keyed (bs, role)
++        # and its planner needs a role, so DP attention is refused instead of being half-supported.
++        if self.ss_fast and getattr(model_runner.server_args, "enable_dp_attention", False):
++            raise ValueError("SELFSPEC_FASTATTN=1 does not support --enable-dp-attention (IDLE forwards carry no draft/verify role)")
++        # SELFSPEC_MROPE_FIX=1 (self-spec servers only; default 0 = unchanged): M-RoPE rows copied as contiguous
++        # pairs in replay (populate_from_forward_batch(mrope_rows=...)), DLLM_PROF / DLLM_GRAPH_DBG read once here instead of per replay.
++        self.ss_mrope_fix = bool(self.is_selfspec and os.environ.get("SELFSPEC_MROPE_FIX", "0") == "1")
++        self._env_dllm_prof = os.environ.get("DLLM_PROF", "0") == "1"
++        self._env_graph_dbg = os.environ.get("DLLM_GRAPH_DBG", "0") == "1"
++        if self.is_selfspec:
++            logger.info(f"[selfspec] cuda graph runner: fastattn={int(self.ss_fast)} padfix={int(self.ss_padfix)} "
++                        f"mrope_fix={int(self.ss_mrope_fix)} "
++                        f"disable_padding={int(bool(model_runner.server_args.disable_cuda_graph_padding))}")
  
          self.capture_forward_mode = ForwardMode.DECODE
          self.capture_hidden_mode = CaptureHiddenMode.NULL
-@@ -551,6 +566,7 @@ class CudaGraphRunner:
+@@ -551,6 +606,7 @@ class CudaGraphRunner:
              model_runner.spec_algorithm.is_eagle()
              or model_runner.spec_algorithm.is_standalone()
              or model_runner.spec_algorithm.is_ngram()
@@ -387,7 +799,21 @@ index c7c7d6b..4816031 100644
          ):
              if self.model_runner.is_draft_worker:
                  raise RuntimeError("This should not happen")
-@@ -720,16 +736,74 @@ class CudaGraphRunner:
+@@ -679,6 +735,13 @@ class CudaGraphRunner:
+         graph_key = cuda_graph_bs
+         if self.enable_pdmux:
+             graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
++        # With --disable-cuda-graph-padding the membership test must use the key replay() will use
++        # (dual-causal graphs are keyed (bs, causal), fast-path graphs (bs, role)); the bare bs key is never in self.graphs there,
++        # so every forward would silently run eager.
++        if self.is_dual_causal_graph:
++            graph_key = (graph_key, bool(getattr(forward_batch, "dllm_ragged_causal", False)))
++        if self.ss_fast:
++            graph_key = (graph_key, getattr(forward_batch.spec_info, "selfspec_role", None))
+ 
+         is_bs_supported = (
+             graph_key in self.graphs
+@@ -720,16 +783,97 @@ class CudaGraphRunner:
                  forward_batch.batch_size * self.num_tokens_per_bs
                  == forward_batch.input_ids.numel()
              )
@@ -417,10 +843,9 @@ index c7c7d6b..4816031 100644
 +        # custom_mask has sum_req K*(seq_len_req + K) elements and grows with the context, while the cuda
 +        # graph replays flashinfer's fixed packed buffer cuda_graph_custom_mask (max_num_tokens*max_context_len
 +        # uint8). Overflowing it kills the scheduler with an illegal memory access at replay.
-+        # Only the overflowing batches run eager; output is identical, verified
-+        # (mask ON + cudagraph OFF vs AR: 12/12 pages identical).
-+        # This must live in can_run(): nothing reads batch.can_run_cuda_graph, so assigning it was a no-op
-+        # in an earlier version; this return value is the only place where False actually forces eager.
++        # Only the overflowing batches run eager; the output is identical (verified against AR).
++        # This must live in can_run(): nothing reads batch.can_run_cuda_graph, so assigning it is a no-op;
++        # this return value is the only place where False actually forces eager.
 +        is_selfspec_mask_supported = True
 +        _spec = getattr(forward_batch, "spec_info", None)
 +        _mask = getattr(_spec, "custom_mask", None)
@@ -430,6 +855,16 @@ index c7c7d6b..4816031 100644
 +                # segment_packbits pads each request (segment) to a byte boundary, so the bound is
 +                # ceil(total/8) + number of segments. Be conservative.
 +                _packed_upper = _mask.numel() // 8 + forward_batch.batch_size + 1
++                if self.ss_padfix and forward_batch.forward_mode.is_target_verify():
++                    # SELFSPEC_PADFIX=1: replay_prepare pads the mask for the dummy rows of the
++                    # captured size this batch replays at, so the guard must count those rows too (else a padded batch near
++                    # the buffer size passes the guard and the padded mask overflows it).
++                    _bi = bisect.bisect_left(self.capture_bs, forward_batch.batch_size)
++                    if _bi < len(self.capture_bs):
++                        _bsp = self.capture_bs[_bi]
++                        _K = self.num_tokens_per_bs
++                        _pad = (_bsp - forward_batch.batch_size) * _K * (self.seq_len_fill_value + _K)
++                        _packed_upper = (_mask.numel() + _pad) // 8 + _bsp + 1
 +                if _packed_upper > _cap.numel():
 +                    is_selfspec_mask_supported = False
 +                    if not getattr(self, "_warned_mask_overflow", False):
@@ -452,6 +887,19 @@ index c7c7d6b..4816031 100644
 +                      f"hidden={capture_hidden_mode_matches} ngram={is_ngram_supported} mm={is_mm_supported} "
 +                      f"cuda_graph_bs={cuda_graph_bs} max_bs={self.max_bs} disable_pad={self.disable_padding} "
 +                      f"req_hidden={forward_batch.capture_hidden_mode} cap_hidden={self.capture_hidden_mode}", flush=True)
++        # SELFSPEC_FASTATTN: graphs are keyed (bs, role); a TARGET_VERIFY forward without a role has no graph -> eager. The
++        # host-planned attention needs seq_lens_cpu (replay_prepare would otherwise hand it stale buffer values) -> eager raises.
++        # A draft window longer than K (SELFSPEC_TRAIN_MASKS=1) already fails is_ngram_supported above -> eager.
++        # On the fast path every graph is a (bs, role) graph, so any forward without a role (whatever its mode)
++        # runs eager rather than looking up a (bs, None) key.
++        is_ss_role_supported = True
++        if self.ss_fast:
++            is_ss_role_supported = (
++                getattr(_spec, "selfspec_role", None) in ("draft", "verify")
++                and forward_batch.forward_mode.is_target_verify()
++                and forward_batch.seq_lens_cpu is not None
++                and getattr(_spec, "ss_shadow_mask", None) is None   # SELFSPEC_SHADOW compares eager forwards only
++            )
          return (
              is_bs_supported
              and is_encoder_lens_supported
@@ -460,10 +908,11 @@ index c7c7d6b..4816031 100644
              and is_ngram_supported
 +            and is_mm_supported
 +            and is_selfspec_mask_supported
++            and is_ss_role_supported
          )
  
      def _init_profile_context_and_memory_record(self):
-@@ -790,14 +864,21 @@ class CudaGraphRunner:
+@@ -790,14 +934,25 @@ class CudaGraphRunner:
                      num_tokens=bs * self.num_tokens_per_bs,
                      tp_group=self.model_runner.tp_group,
                  ) as forward:
@@ -478,22 +927,26 @@ index c7c7d6b..4816031 100644
 +                    # dllm self-spec: capture two graphs per bs (bidir draft + causal verify),
 +                    # keyed (base_key, causal). Other paths: one graph keyed by base_key.
 +                    dllm_variants = (False, True) if getattr(self, "is_dual_causal_graph", False) else (None,)
-+                    for dcausal in dllm_variants:
++                    # SELFSPEC_FASTATTN: two graphs per bs, keyed (bs, "draft") / (bs, "verify")
++                    ss_roles = ("draft", "verify") if self.ss_fast else (None,)
++                    for dcausal, ss_role in [(d, r) for d in dllm_variants for r in ss_roles]:
 +                        (
 +                            graph,
 +                            output_buffers,
 +                        ) = self.capture_one_batch_size(
-+                            bs, forward, stream_idx, dllm_causal=dcausal
++                            bs, forward, stream_idx, dllm_causal=dcausal, ss_role=ss_role
 +                        )
 +                        # For pd_multiplexing, we need to save the graph and output buffers
 +                        base_key = bs if stream_idx is None else f"{stream_idx}_{bs}"
 +                        key = base_key if dcausal is None else (base_key, dcausal)
++                        if ss_role is not None:
++                            key = (key, ss_role)
 +                        self.graphs[key] = graph
 +                        self.output_buffers[key] = output_buffers
  
          # Trigger CUDA graph capture for specific shapes.
          # Capture the large shapes first so that the smaller shapes
-@@ -837,7 +918,11 @@ class CudaGraphRunner:
+@@ -837,7 +992,12 @@ class CudaGraphRunner:
          return torch.cuda.CUDAGraph()
  
      def capture_one_batch_size(
@@ -503,10 +956,20 @@ index c7c7d6b..4816031 100644
 +        forward: Callable,
 +        stream_idx: Optional[int] = None,
 +        dllm_causal: Optional[bool] = None,
++        ss_role: Optional[str] = None,
      ):
          buffers: DecodeInputBuffers = self.buffers
          graph = self._create_device_graph()
-@@ -964,6 +1049,14 @@ class CudaGraphRunner:
+@@ -901,6 +1061,8 @@ class CudaGraphRunner:
+             global_dp_buffer_len = None
+ 
+         spec_info = self.get_spec_info(num_tokens)
++        if ss_role is not None:
++            spec_info.selfspec_role = ss_role   # routes the attention backend to the role's wrapper / mask mode
+         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
+             self.capture_hidden_mode = (
+                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+@@ -964,6 +1126,14 @@ class CudaGraphRunner:
              lora_ids=lora_ids,
          )
  
@@ -521,7 +984,15 @@ index c7c7d6b..4816031 100644
          # HiSparse: set coordinator so the hisparse code path is captured into the graph
          forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
          if forward_batch.hisparse_coordinator is not None:
-@@ -1111,7 +1204,12 @@ class CudaGraphRunner:
+@@ -1103,6 +1273,7 @@ class CudaGraphRunner:
+                 self.model_runner.server_args
+             ),
+             pp_proxy_tensors=pp_proxy_tensors,
++            mrope_rows=self.ss_mrope_fix,
+         )
+         if self.enable_two_batch_overlap:
+             self.tbo_plugin.replay_prepare(
+@@ -1111,8 +1282,24 @@ class CudaGraphRunner:
                  num_token_non_padded=len(forward_batch.input_ids),
                  spec_info=forward_batch.spec_info,
              )
@@ -530,23 +1001,35 @@ index c7c7d6b..4816031 100644
 +        if (
 +            forward_batch.forward_mode.is_idle()
 +            and forward_batch.spec_info is not None
-+            and not (self.is_selfspec and os.environ.get("SELFSPEC_NOMASK", "0") == "1")
++            and not (self.is_selfspec and (os.environ.get("SELFSPEC_NOMASK", "0") == "1" or self.ss_fast))
 +        ):
              forward_batch.spec_info.custom_mask = buffers.custom_mask
++        # SELFSPEC_PADFIX=1 (old custom-mask path): when raw_bs is not a captured size the replay runs at
++        # bs > raw_bs; generate_attn_arg_prefill builds qo/kv indptr for all bs rows (padded rows: qo=K, kv=fill+K), so
++        # segment_packbits reads mask_indptr[-1] bools while the worker's mask only covers the raw_bs real requests -> out-of-bounds
++        # read (illegal memory access). Pad with ones (dummy rows, out_cache_loc 0, outputs discarded).
++        # The fast path (SELFSPEC_FASTATTN=1) has no mask, so nothing to pad.
++        if self.ss_padfix and bs > raw_bs and not forward_batch.forward_mode.is_idle():
++            _sm = getattr(forward_batch.spec_info, "custom_mask", None)
++            if _sm is not None:
++                _K = self.num_tokens_per_bs
++                _pad = (bs - raw_bs) * _K * (self.seq_len_fill_value + _K)
++                forward_batch.spec_info.custom_mask = torch.cat([_sm.view(-1), _sm.new_ones(_pad)])
          # Attention backend
          if self.enable_pdmux:
-@@ -1146,6 +1244,10 @@ class CudaGraphRunner:
+             stream_idx = get_current_stream_idx()
+@@ -1146,6 +1333,10 @@ class CudaGraphRunner:
      ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
          self.deepep_adapter.replay()
  
-+        _gp = os.environ.get("DLLM_PROF", "0") == "1"
++        _gp = self._env_dllm_prof if self.ss_mrope_fix else os.environ.get("DLLM_PROF", "0") == "1"
 +        if _gp:
 +            import time as _gt
 +            torch.cuda.synchronize(); _gpa = _gt.perf_counter()
          if not skip_attn_backend_init:
              self.replay_prepare(forward_batch, pp_proxy_tensors)
          else:
-@@ -1158,7 +1260,33 @@ class CudaGraphRunner:
+@@ -1158,7 +1349,38 @@ class CudaGraphRunner:
              graph_key = f"{get_current_stream_idx()}_{self.bs}"
          else:
              graph_key = self.bs
@@ -554,7 +1037,12 @@ index c7c7d6b..4816031 100644
 +        # forward's ragged-causal flag (set by the algorithm: False=draft, True=verify).
 +        if self.is_dual_causal_graph:
 +            graph_key = (graph_key, bool(getattr(forward_batch, "dllm_ragged_causal", False)))
-+        if os.environ.get("DLLM_GRAPH_DBG", "0") == "1":
++        if self.ss_fast:
++            _role = getattr(forward_batch.spec_info, "selfspec_role", None)
++            if _role is None:
++                raise RuntimeError("[selfspec-fastattn] graph replay of a forward without a draft/verify role (can_run sends those eager)")
++            graph_key = (graph_key, _role)
++        if (self._env_graph_dbg if self.ss_mrope_fix else os.environ.get("DLLM_GRAPH_DBG", "0") == "1"):
 +            b = self.buffers
 +            mp = b.mrope_positions
 +            print(f"[graphdbg] in_ids={b.input_ids[:self.raw_num_token].tolist()} "
@@ -580,7 +1068,7 @@ index c7c7d6b..4816031 100644
          output = self.output_buffers[graph_key]
  
          if isinstance(output, LogitsProcessorOutput):
-@@ -1210,12 +1338,31 @@ class CudaGraphRunner:
+@@ -1210,12 +1432,29 @@ class CudaGraphRunner:
                      seq_lens_cpu=None,
                  )
  
@@ -596,16 +1084,14 @@ index c7c7d6b..4816031 100644
 +            #   (1) the [K, prefix+K] bool mask global load disappears (a substantially faster forward), and
 +            #   (2) the crash from a context-proportional mask overflowing the fixed buffer is eliminated.
 +            # Capturing WITH a mask bakes a read of buffers.custom_mask into the graph, but at runtime
-+            # nothing copies our mask into that buffer, so attention ran on garbage ->
-+            # corrupted output (no-mask + graph: 7/12 pages differed from AR; no-mask + eager was correct).
-+            # Capture, runtime and backend must all read the SAME flag (SELFSPEC_NOMASK).
-+            # An earlier version read a separate capture-only flag, so the worker skipped the mask while the
-+            # capture still passed one -> flashinfer demanded custom_mask_buf and crashed.
-+            # Now on the mask-free path the wrapper is created without custom_mask_buf (MaskMode fixed to
++            # nothing copies our mask into that buffer, so attention would run on garbage -> corrupted output.
++            # Capture, runtime and backend must all read the SAME flag (SELFSPEC_NOMASK): if only the capture
++            # passed a mask while the worker skipped it, flashinfer would demand custom_mask_buf and crash.
++            # On the mask-free path the wrapper is created without custom_mask_buf (MaskMode fixed to
 +            # CAUSAL/NON_CAUSAL) and direction is selected by having two graphs (draft/verify).
 +            _selfspec_nomask = (
 +                self.model_runner.spec_algorithm.is_selfspec_diffusion()
-+                and os.environ.get("SELFSPEC_NOMASK", "0") == "1"
++                and (os.environ.get("SELFSPEC_NOMASK", "0") == "1" or self.ss_fast)
 +            )
              spec_info = NgramVerifyInput(
                  draft_token=None,
@@ -615,10 +1101,93 @@ index c7c7d6b..4816031 100644
                  retrive_index=None,
                  retrive_next_token=None,
 diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
-index eaecdc5..01f6b97 100644
+index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..2a6e3f1fafb557e3ba8840ddc9fa2ef64ecf9086 100644
 --- a/python/sglang/srt/model_executor/forward_batch_info.py
 +++ b/python/sglang/srt/model_executor/forward_batch_info.py
-@@ -524,14 +524,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+@@ -77,6 +77,82 @@ if TYPE_CHECKING:
+ 
+ _is_npu = is_npu()
+ 
++# SELFSPEC_MROPE_FIX=1 (default 0 = the code below, unchanged): the self-spec (draft / verify)
++# M-RoPE positions without a host sync. The old branch caches the device copy of each request's mrope_position_delta on
++# mm_input._mrope_delta_dev but compares d.device (cuda:0) with torch.device(model_runner.device) (the string "cuda" -> device
++# index None): never equal, so the cache misses on EVERY forward and the pageable `.to(device)` (a blocking copy) waits for the
++# queued GPU work -- in the verify forward that is the whole draft graph. With the flag:
++#   * the [bs, 1] device delta is cached per batch composition (key = the requests' CPU delta tensor objects, by identity; the
++#     cache holds them, so an id cannot be reused) and uploaded with one non_blocking copy only when the composition changes;
++#   * the [3, bs*n] positions are ONE broadcast-add kernel into a contiguous output (was stack + add + flatten + repeat).
++# The values are the same int64 as the old branch; SELFSPEC_CHECK=1 recomputes the old branch every forward and raises on any
++# difference (it syncs: diagnostic only).
++import os as _os
++
++_SS_MROPE_FIX = _os.environ.get("SELFSPEC_MROPE_FIX", "0") == "1"
++_SS_MROPE_CHECK = _SS_MROPE_FIX and _os.environ.get("SELFSPEC_CHECK", "0") == "1"
++_ss_mrope_cache = {"key": None, "val": None, "misses": 0, "checked": 0}
++
++
++def _ss_spec_mrope_delta(mm_inputs, batch_size: int, device) -> torch.Tensor:
++    """SELFSPEC_MROPE_FIX: the device [bs, 1] M-RoPE delta of the current batch, cached per composition. The key is each request's
++    CPU mrope_position_delta tensor object (None for a request without mm inputs), compared by identity; the cache keeps those
++    objects alive, so a key cannot alias a new request. mrope_position_delta is fixed at prefill (scheduler.py
++    _maybe_compute_mrope_positions / MultimodalInputs.merge assign a new tensor, nothing mutates it in place). A miss builds the
++    same stack as the old branch on the host and uploads it once through pinned memory, non_blocking (no stream sync)."""
++    c = _ss_mrope_cache
++    key = tuple(None if mi is None else mi.mrope_position_delta for mi in mm_inputs)
++    prev = c["key"]
++    if prev is not None and len(prev) == len(key) and all(a is b for a, b in zip(prev, key)):
++        return c["val"]
++    if all(mi is None for mi in mm_inputs):
++        cpu = torch.zeros((batch_size, 1), dtype=torch.int64)
++    else:   # exactly the old branch's per-request values (it raises the same way on a request whose delta is None)
++        cpu = torch.stack(
++            [torch.zeros(1, dtype=torch.int64) if mi is None else mi.mrope_position_delta.squeeze(0) for mi in mm_inputs], dim=0
++        )
++    val = cpu.pin_memory().to(device=device, non_blocking=True)
++    c["key"], c["val"] = key, val
++    c["misses"] += 1
++    return val
++
++
++def _ss_spec_mrope_positions(seq_positions: torch.Tensor, mm_inputs, batch_size: int, device) -> torch.Tensor:
++    """SELFSPEC_MROPE_FIX: [3, bs*n] M-RoPE positions = seq_positions + per-request delta on all three rows (the old branch's
++    (seq + delta).flatten().unsqueeze(0).repeat(3, 1)), as one broadcast add into a contiguous output."""
++    delta = _ss_spec_mrope_delta(mm_inputs, batch_size, device)
++    if delta.dim() != 2 or delta.shape[0] != batch_size or delta.shape[1] != 1:   # not the [bs, 1] layout: old formula, cached delta
++        return (seq_positions + delta).flatten().unsqueeze(0).repeat(3, 1)
++    n = seq_positions.shape[1]
++    out = torch.empty((3, batch_size, n), dtype=torch.result_type(seq_positions, delta), device=seq_positions.device)
++    torch.add(seq_positions.unsqueeze(0).expand(3, batch_size, n), delta.view(1, batch_size, 1), out=out)
++    return out.view(3, batch_size * n)
++
++
++def _ss_spec_mrope_check(new: torch.Tensor, seq_positions: torch.Tensor, mm_inputs, batch_size: int, device) -> None:
++    """SELFSPEC_MROPE_FIX + SELFSPEC_CHECK: recompute the old branch (fresh blocking upload, as its cache always missed) and
++    require identical shape, dtype and values. Syncs; diagnostic only."""
++    if all(mi is None for mi in mm_inputs):
++        delta = torch.zeros((batch_size, 1), dtype=torch.int64, device=device)
++    else:
++        delta = torch.stack(
++            [torch.zeros(1, dtype=torch.int64, device=device) if mi is None else mi.mrope_position_delta.squeeze(0).to(device=device)
++             for mi in mm_inputs], dim=0,
++        )
++    old = (seq_positions + delta).flatten().unsqueeze(0).repeat(3, 1)
++    if old.shape != new.shape or old.dtype != new.dtype or not torch.equal(old, new):
++        raise RuntimeError(f"[selfspec-mrope-check] positions differ: old {tuple(old.shape)} {old.dtype} vs new {tuple(new.shape)} "
++                           f"{new.dtype}; old[:, :8]={old[:, :8].tolist()} new[:, :8]={new[:, :8].tolist()}")
++    c = _ss_mrope_cache
++    c["checked"] += 1
++    if c["checked"] in (1, 10, 100, 1000) or c["checked"] % 10000 == 0:
++        import logging
++
++        logging.getLogger(__name__).info(
++            f"[selfspec-mrope-check] {c['checked']} spec forwards: M-RoPE positions == old branch (bs={batch_size}, "
++            f"composition misses {c['misses']})"
++        )
++
+ 
+ class ForwardMode(IntEnum):
+     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
+@@ -524,14 +600,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
  
          # Override the positions with diffusion LLM or spec_info
          if batch.dllm_config is not None:
@@ -643,7 +1212,7 @@ index eaecdc5..01f6b97 100644
                  ],
                  dtype=positions_dtype,
              ).to(device, non_blocking=True)
-@@ -541,6 +549,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+@@ -541,6 +625,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
          ):
              ret.positions = ret.spec_info.positions
  
@@ -657,7 +1226,18 @@ index eaecdc5..01f6b97 100644
          # Init position information
          if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
              if ret.positions is None:
-@@ -721,15 +736,27 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+@@ -715,21 +806,38 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+ 
+         else:  # target_verify or draft_decode
+             seq_positions = batch.spec_info.positions.view(batch_size, -1)
++            if _SS_MROPE_FIX:
++                self.mrope_positions = _ss_spec_mrope_positions(seq_positions, mm_inputs, batch_size, device)
++                if _SS_MROPE_CHECK:
++                    _ss_spec_mrope_check(self.mrope_positions, seq_positions, mm_inputs, batch_size, device)
++                return
+             # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
+             if all(mm_input is None for mm_input in mm_inputs):
+                 mrope_delta_tensor = torch.zeros(
                      (batch_size, 1), dtype=torch.int64, device=device
                  )
              else:
@@ -671,9 +1251,9 @@ index eaecdc5..01f6b97 100644
 -                ]
 -                mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
 +                # mrope_position_delta is constant for the life of a request (fixed by the image grid at prefill),
-+                # yet it used to be stacked from CPU tensors and moved to the device on every forward ->
-+                # two H2D copies per round (draft/verify). Now a device copy is cached once on mm_input
-+                # and the stack happens on the device (no H2D; identical result).
++                # yet the stock code stacks CPU tensors and moves them to the device on every forward ->
++                # two H2D copies per round (draft/verify). Here a device copy is cached on mm_input and the
++                # stack happens on the device (identical result; see SELFSPEC_MROPE_FIX above for the cache key).
 +                mrope_deltas = []
 +                for i in range(batch_size):
 +                    mi = mm_inputs[i]
@@ -694,7 +1274,7 @@ index eaecdc5..01f6b97 100644
              next_input_positions = (
                  (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
              )
-@@ -773,6 +800,37 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+@@ -773,6 +881,37 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                          mm_input, self.seq_lens_cpu[batch_idx]
                      )
                      mrope_positions_list[batch_idx] = mrope_positions
@@ -706,8 +1286,8 @@ index eaecdc5..01f6b97 100644
 +                #    (image-aware; same as is_extend).
 +                #  - p >= prompt_len (decode)    -> continue +1 per token from the last prompt mrope
 +                #    (text continuation; all 3 dims equal).
-+                # Bug before: base=max(image_mrope)+1+off applied text positions to image chunks AND
-+                # double-counted the image span (+83 offset) -> garbled / mid-response reads.
++                # A single text base (max(image_mrope)+1+off) would apply text positions to image chunks AND
++                # double-count the image span -> garbled / mid-response reads.
 +                off = int(batch.extend_prefix_lens[batch_idx])
 +                # actual extend length (block_size for a decode block; larger for an un-chunked
 +                # prefill chunk). Hardcoding block_size gave too few mrope positions for a
@@ -733,10 +1313,21 @@ index eaecdc5..01f6b97 100644
                  extend_seq_len, extend_prefix_len = (
                      batch.extend_seq_lens[batch_idx],
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index a59742b..8ed5968 100644
+index a59742b9435445d71c2d583a51e56ec782f3e95a..05cfeac18def49e8effa9fb4c802427751effae8 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -2087,6 +2087,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -344,6 +344,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
+         self.attention_chunk_size = model_config.attention_chunk_size
+         self.forward_pass_id = 0
++        # SELFSPEC_MROPE_FIX=1 on a self-spec server: DLLM_PROF read once here instead of twice per forward
++        # (forward / _forward_raw). Other servers (AR included) keep the per-forward read, unchanged.
++        self._ss_env_once = bool(self.spec_algorithm.is_selfspec_diffusion() and os.environ.get("SELFSPEC_MROPE_FIX", "0") == "1")
++        self._env_dllm_prof = os.environ.get("DLLM_PROF", "0") == "1"
+         self.init_new_workspace = False
+         self.draft_model_idx = draft_model_idx
+         self.enable_hisparse = server_args.enable_hisparse
+@@ -2087,6 +2091,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              self.spec_algorithm.is_eagle()
              or self.spec_algorithm.is_standalone()
              or self.spec_algorithm.is_ngram()
@@ -744,7 +1335,7 @@ index a59742b..8ed5968 100644
          ):
              return not self.is_draft_worker
  
-@@ -2121,6 +2122,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2121,6 +2126,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              self.spec_algorithm.is_eagle()
              or self.spec_algorithm.is_standalone()
              or self.spec_algorithm.is_ngram()
@@ -752,7 +1343,7 @@ index a59742b..8ed5968 100644
          ):
              if self.is_draft_worker:
                  raise RuntimeError("This should not happen")
-@@ -2270,7 +2272,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2270,7 +2276,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                          seq_lens_cpu=None,
                      )
  
@@ -764,12 +1355,12 @@ index a59742b..8ed5968 100644
                  from sglang.srt.speculative.ngram_info import NgramVerifyInput
  
                  spec_info = NgramVerifyInput(
-@@ -2732,10 +2737,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2732,10 +2741,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
      ) -> ModelRunnerOutput:
          self.forward_pass_id += 1
  
 +        import os as _os3
-+        _wp = _os3.environ.get("DLLM_PROF", "0") == "1"
++        _wp = self._env_dllm_prof if self._ss_env_once else _os3.environ.get("DLLM_PROF", "0") == "1"
 +        if _wp:
 +            import time as _wt, torch as _wtor
 +            _wtor.cuda.synchronize(); _wa = _wt.perf_counter()
@@ -783,7 +1374,7 @@ index a59742b..8ed5968 100644
              output = self._forward_raw(
                  forward_batch,
                  skip_attn_backend_init,
-@@ -2743,6 +2756,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2743,6 +2760,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                  reinit_attn_backend,
                  split_forward_count,
              )
@@ -798,7 +1389,7 @@ index a59742b..8ed5968 100644
              elastic_ep_state = ElasticEPStateManager.instance()
              if (
                  elastic_ep_state is not None
-@@ -2779,6 +2800,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2779,6 +2804,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
          if dumper.may_enable:
              dumper.step()
  
@@ -811,12 +1402,12 @@ index a59742b..8ed5968 100644
          return output
  
      def _forward_raw(
-@@ -2794,11 +2821,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2794,11 +2825,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              if self.device == "cpu"
              else forward_batch.forward_mode.is_cuda_graph
          )
 +        import os as _os2
-+        _fp = _os2.environ.get("DLLM_PROF", "0") == "1"
++        _fp = self._env_dllm_prof if self._ss_env_once else _os2.environ.get("DLLM_PROF", "0") == "1"
 +        if _fp:
 +            import time as _ft, torch as _ftor
 +            _ftor.cuda.synchronize(); _fa = _ft.perf_counter()
@@ -841,7 +1432,7 @@ index a59742b..8ed5968 100644
          if can_run_graph:
              ret = self.graph_runner.replay(
 diff --git a/python/sglang/srt/models/glm4v.py b/python/sglang/srt/models/glm4v.py
-index 9bb5a92..955c635 100644
+index 9bb5a92b2cdc30b5add2420bc3e38eed03cdd95f..76542bd198521af028fe9b0f01c8f8b6bfa26fc4 100644
 --- a/python/sglang/srt/models/glm4v.py
 +++ b/python/sglang/srt/models/glm4v.py
 @@ -584,7 +584,10 @@ class Glm4vForConditionalGeneration(nn.Module):
@@ -877,10 +1468,27 @@ index 9bb5a92..955c635 100644
              forward_batch.forward_mode.is_decode()
              or not forward_batch.contains_image_inputs()
 diff --git a/python/sglang/srt/models/glm_ocr.py b/python/sglang/srt/models/glm_ocr.py
-index bb74461..dfa603e 100644
+index bb74461d56ba71a388ded342cf8d6561a50507d8..13575658780ca457fde8b39fdb2b04262a3d48bb 100644
 --- a/python/sglang/srt/models/glm_ocr.py
 +++ b/python/sglang/srt/models/glm_ocr.py
-@@ -305,7 +305,7 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
+@@ -222,7 +222,16 @@ class GlmOcrVisionModel(Glm4vVisionModel):
+             vision_config.hidden_size, eps=vision_config.rms_norm_eps
+         )
+ 
++    # SS_GLM_VIT_GRAPH_MAXM>0 sets self._ss_vit (multimodal/glm_vit_graph_runner.py) at the end of
++    # GlmOcrForConditionalGeneration.load_weights; unset (default) = the original eager forward below, unchanged.
++    _ss_vit = None
++
+     def forward(self, x: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
++        if self._ss_vit is not None:
++            return self._ss_vit.run(x, grid_thw)
++        return self._ss_forward_orig(x, grid_thw)
++
++    def _ss_forward_orig(self, x: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+         # patchify
+         x = x.to(device=self.device, dtype=self.dtype)
+         x = self.patch_embed(x)
+@@ -305,7 +314,7 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
  
          self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
  
@@ -889,8 +1497,76 @@ index bb74461..dfa603e 100644
          self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
  
          # For EAGLE3 support
+@@ -434,5 +443,26 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
+                     )
+                 weight_loader(param, loaded_weight)
+ 
++        if not is_nextn:
++            self._ss_maybe_capture_vit_graphs()
++
++    def _ss_maybe_capture_vit_graphs(self):
++        """Exact-M ViT CUDA graphs, only with SS_GLM_VIT_GRAPH_MAXM>0 (default off)."""
++        from sglang.srt.multimodal.glm_vit_graph_runner import (
++            GlmVitGraphRunner,
++            glm_vit_graph_maxm,
++        )
++
++        maxm = glm_vit_graph_maxm()
++        if maxm <= 0 or self.visual._ss_vit is not None:
++            return
++        if self.use_data_parallel or self.visual.device.type != "cuda":
++            print(f"[ss-vit-graph] OFF: dp_encoder={self.use_data_parallel} device={self.visual.device}", flush=True)
++            return
++        runner = GlmVitGraphRunner(self.visual, maxm)
++        runner.capture()
++        if runner.graphs or runner.eager_list_ok:
++            self.visual._ss_vit = runner
++
+ 
+ EntryClass = [GlmOcrForConditionalGeneration]
+diff --git a/python/sglang/srt/multimodal/processors/base_processor.py b/python/sglang/srt/multimodal/processors/base_processor.py
+index 839d5b74e0798e257be0a8db9015e389c98ef775..35e97bfbcb5c2e0db0be01ec457286f76930a88c 100644
+--- a/python/sglang/srt/multimodal/processors/base_processor.py
++++ b/python/sglang/srt/multimodal/processors/base_processor.py
+@@ -426,6 +426,10 @@ class BaseMultimodalProcessor(ABC):
+             return_tensors="pt",
+             **kwargs,
+         )
++        if getattr(self, "_ss_pv_bf16", False):  # SS_GLM_PV_BF16=1: set by processors/glm4v.py, default off
++            _pv = result.get("pixel_values")
++            if isinstance(_pv, torch.Tensor) and _pv.is_cuda and _pv.dtype == torch.float32:
++                result["pixel_values"] = _pv.to(torch.bfloat16)
+         if not self.server_args.keep_mm_feature_on_device:
+             # move feature tensors to cpu
+             for feature_name in self.FEATURE_NAMES:
+diff --git a/python/sglang/srt/multimodal/processors/glm4v.py b/python/sglang/srt/multimodal/processors/glm4v.py
+index a44f14b6ca28af092fe51333a8460e89a2829b68..8f7146f250b8ec8614da219d775521a2cf62d5ba 100644
+--- a/python/sglang/srt/multimodal/processors/glm4v.py
++++ b/python/sglang/srt/multimodal/processors/glm4v.py
+@@ -1,3 +1,4 @@
++import os
+ from typing import List, Union
+ 
+ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+@@ -30,6 +31,16 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
+ 
+     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
++        # SS_GLM_PV_BF16=1 (default off): cast pixel_values to bf16 on the GPU in the TM, before the
++        # .to("cpu") in base_processor.process_mm_data (half the bytes through D2H / shm / zmq / H2D). The scheduler's
++        # get_image_feature casts the same fp32 CUDA tensor to the same bf16 today (.type(visual.dtype)), so the values
++        # are identical; only for a bf16 model.
++        if os.environ.get("SS_GLM_PV_BF16", "0") == "1":
++            dt = str(getattr(hf_config, "torch_dtype", None) or getattr(hf_config, "dtype", None) or "")
++            ok = "bfloat16" in dt and str(getattr(server_args, "dtype", "auto")) in ("auto", "bfloat16")
++            self._ss_pv_bf16 = ok
++            print(f"[ss-glm-pv-bf16] {'ON' if ok else 'OFF'} (model dtype {dt}, server dtype {getattr(server_args, 'dtype', None)})",
++                  flush=True)
+ 
+         # GLM-V specific tokens
+         self.IMAGE_TOKEN = "<|image|>"
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index d91ced8..7b6d06b 100644
+index d91ced805f5da9e7a0cb6cbdf4ee3e7fd498a696..7b6d06b5ded0ccb8b53baa1b63d3cb76e37a9f3b 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -3132,6 +3132,28 @@ class ServerArgs:
@@ -932,7 +1608,7 @@ index d91ced8..7b6d06b 100644
          )
          parser.add_argument(
 diff --git a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
-index 40e859b..c386a99 100644
+index 40e859b2d6d6585c152960b8c98c75c1cd67f24d..c386a99c2085595bcf7e7a99240de413e26e0dd7 100644
 --- a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
 +++ b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
 @@ -79,6 +79,10 @@ class EAGLEDraftCudaGraphRunner:
@@ -959,7 +1635,7 @@ index 40e859b..c386a99 100644
          graph = self._create_graph()
          stream = self.stream
 diff --git a/python/sglang/srt/speculative/ngram_info.py b/python/sglang/srt/speculative/ngram_info.py
-index 7aafe98..a864edc 100644
+index 7aafe98707694f96c5241123d6bfd7452fda4391..64088128cb648a2a3b45ef1e4d71148f056941c5 100644
 --- a/python/sglang/srt/speculative/ngram_info.py
 +++ b/python/sglang/srt/speculative/ngram_info.py
 @@ -2,6 +2,7 @@ from __future__ import annotations
@@ -976,7 +1652,7 @@ index 7aafe98..a864edc 100644
          self.draft_token_num = draft_token_num
 -        self.device = self.custom_mask.device
 +        # custom_mask may be None (a linear chain is plain causal and needs no mask).
-+        # Derive the device from another tensor in that case; this used to raise AttributeError.
++        # Derive the device from another tensor in that case; otherwise this raises AttributeError.
 +        self.device = (
 +            self.custom_mask.device if self.custom_mask is not None
 +            else (self.draft_token.device if self.draft_token is not None
@@ -1003,7 +1679,7 @@ index 7aafe98..a864edc 100644
 +
 +        i=0 (the seed) is included too. The seed was probably accumulated in the previous round,
 +        but we do not rely on that: the `already` check prevents double application, so inclusion is safe.
-+        (A unit check without i=0 showed an error whenever the seed was absent from base.)
++        (Without i=0 the result is wrong whenever the seed is absent from base.)
 +
 +        Cost: only K(K-1)/2 (r,i) pairs are corrected (K=32 -> 496). Expanding the whole vocab per
 +        position ([bs,K,V]) would be ~155 MB at bs 8; advanced indexing does it in a handful of kernels.
@@ -1047,25 +1723,24 @@ index 7aafe98..a864edc 100644
      def _greedy_verify(
          self,
          batch: ScheduleBatch,
-@@ -412,6 +474,17 @@ class NgramVerifyInput(SpecInput):
+@@ -412,6 +474,16 @@ class NgramVerifyInput(SpecInput):
                          sampling_info.logit_bias, self.draft_token_num, dim=0
                      )
                  )
 +            # The apply above is "relaxed" (per the SGLang comment): all K block positions get the penalty
 +            # state from BEFORE the block. AR advances one token at a time, so at position r its state
-+            # also includes block[0..r]. That difference makes spec output diverge from AR
-+            # (measured on 41 pages: 29 differed, similarity median 0.995 / min 0.54 — large on pages
-+            #  where repetition occurs, which is exactly where the penalty matters).
++            # also includes block[0..r]. That difference makes spec output diverge from AR, most on pages
++            # where repetition occurs, which is exactly where the penalty matters.
 +            # -> below, the missing triangular share is added so the result matches AR exactly.
 +            # Safety: the repetition penalizer SETs values via scatter_, so it is idempotent; tokens already
 +            #      reflected in base (base != 1.0) are skipped to avoid double application.
-+            # Default OFF so existing measurements do not change silently; enable with SELFSPEC_EXACT_PENALTY=1.
++            # Default OFF (stock relaxed behavior); enable with SELFSPEC_EXACT_PENALTY=1.
 +            if os.environ.get("SELFSPEC_EXACT_PENALTY", "0") == "1":
 +                self._exact_block_repetition_penalty(sampling_info, logits_output, bs)
  
          # Apply grammar mask
          if vocab_mask is not None:
-@@ -439,6 +512,8 @@ class NgramVerifyInput(SpecInput):
+@@ -439,6 +511,8 @@ class NgramVerifyInput(SpecInput):
          self._fill_requests(batch, logits_output)
  
          accept_length_cpu = self.accept_length.cpu()
@@ -1075,7 +1750,7 @@ index 7aafe98..a864edc 100644
  
          self._free_cache(batch, page_size, accept_length_cpu)
 diff --git a/python/sglang/srt/speculative/spec_info.py b/python/sglang/srt/speculative/spec_info.py
-index a40a8aa..561830d 100644
+index a40a8aa0dc333bfbe59cae8ab9d9a766847f2453..561830dae00f63949fec46f146b5283643e4993d 100644
 --- a/python/sglang/srt/speculative/spec_info.py
 +++ b/python/sglang/srt/speculative/spec_info.py
 @@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):

@@ -42,10 +42,31 @@ if [ "$MODE" = "spec" ]; then
   # our block-diffusion self-spec — needs the SELFSPEC_DIFFUSION CLI choice patched into server_args.py
   # (patches/sglang, applied to the SGLang checkout $VBIN was built from) + page_size 1. Lossless == AR-greedy.
   SPEC_ARGS="--speculative-algorithm SELFSPEC_DIFFUSION --speculative-num-draft-tokens ${DRAFT:-33} --page-size 1"
+  # GLM-OCR positions (x0 at the AR position + 1) and mask id. A checkpoint dir with block_diffusion.json supplies
+  # the mask id itself; a hub id or a dir without that file gets GLM-OCR's <|mask|>.
+  export SELFSPEC_FULLDRAFT="${SELFSPEC_FULLDRAFT:-1}" SELFSPEC_POS_OFFSET="${SELFSPEC_POS_OFFSET:-1}"
+  [ -f "$CKPT/block_diffusion.json" ] || export SELFSPEC_MASK_ID="${SELFSPEC_MASK_ID:-59282}"
+fi
+# FAST=1: the runtime optimizations in the SGLang patch; outputs are bit-identical to FAST=0.
+#   both modes: GLM ViT as CUDA graphs per patch count, bf16 pixel transport, single-threaded CPU ops in the
+#               server, two tokenizer worker processes
+#   spec:       fast attention without custom masks, M-RoPE delta cache fix, GPU-side commit, host-side
+#               lengths, positions on the device, next round's draft launched ahead of the bookkeeping
+# Any single flag can still be overridden from the environment. EXTRA_ARGS is appended to launch_server.
+FAST="${FAST:-1}"; EXTRA_ARGS="${EXTRA_ARGS:-}"
+if [ "$FAST" = 1 ]; then
+  export SS_GLM_VIT_GRAPH_MAXM="${SS_GLM_VIT_GRAPH_MAXM:-2048}" SS_GLM_PV_BF16="${SS_GLM_PV_BF16:-1}"
+  export OMP_NUM_THREADS="${OMP_NUM_THREADS_SERVER:-1}" MKL_NUM_THREADS="${OMP_NUM_THREADS_SERVER:-1}" TORCH_NUM_THREADS="${OMP_NUM_THREADS_SERVER:-1}"
+  EXTRA_ARGS="--tokenizer-worker-num ${TOKENIZER_WORKERS:-2} $EXTRA_ARGS"
+  if [ "$MODE" = "spec" ]; then
+    export SELFSPEC_FASTATTN="${SELFSPEC_FASTATTN:-1}" SELFSPEC_MROPE_FIX="${SELFSPEC_MROPE_FIX:-1}" \
+           SELFSPEC_FAST_COMMIT="${SELFSPEC_FAST_COMMIT:-1}" SELFSPEC_HOSTLEN="${SELFSPEC_HOSTLEN:-1}" \
+           SELFSPEC_DEV_POS="${SELFSPEC_DEV_POS:-1}" SELFSPEC_DRAFT_AHEAD="${SELFSPEC_DRAFT_AHEAD:-1}"
+  fi
 fi
 
-echo "[serve] MODE=$MODE GPU=$GPU PORT=$PORT CKPT=$CKPT"
+echo "[serve] MODE=$MODE FAST=$FAST GPU=$GPU PORT=$PORT CKPT=$CKPT"
 CUDA_VISIBLE_DEVICES=$GPU exec $VBIN/python -m sglang.launch_server \
   --model-path "$CKPT" --served-model-name glm-ocr --host 127.0.0.1 --port "$PORT" \
   --attention-backend flashinfer --mem-fraction-static "${MEMFRAC:-0.6}" --context-length "${CONTEXT:-8192}" \
-  --trust-remote-code $MAXREQ_ARG $GRAPHBS_ARG $SPEC_ARGS
+  --trust-remote-code $MAXREQ_ARG $GRAPHBS_ARG $SPEC_ARGS $EXTRA_ARGS
