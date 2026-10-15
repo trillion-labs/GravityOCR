@@ -12,7 +12,7 @@ If a number's decode path is not in this table, do not trust it. Mirrored in the
 | `fast_sampling_batched.generate_cached_batched` (`scripts/eval.sh` `--fast`) | same cache, batched (ragged prefixes left-padded) | bs > 1 | confidence | equal to bs 1 only up to floating point (near-tie argmax may flip) |
 | `model.generate_speculative` | nothing (uncached spec reference) | bs 1 | diffusion draft + AR verify | reference spec |
 | `fast_sampling.generate_speculative_prefixcache` (`--spec`) | prefix (vision) only; re-forwards the committed response each round, O(N²) | bs 1 | spec | **byte-identical to AR greedy** |
-| `fast_sampling.generate_speculative_natcache` (`--spec_natcache`) | full committed cache, token-causal incremental, 2 forwards per round | bs 1 | spec | score equals AR greedy (bf16 cache drift can change a token on very long pages) |
+| `fast_sampling.generate_speculative_natcache` (`--spec_natcache`) | full committed cache, token-causal incremental, 2 forwards per round | bs 1 | spec | score equals AR greedy (bf16 cache drift can flip a near-tie token) |
 | `generate_speculative_cached`, `generate_speculative_onecache` | (buggy) | — | — | **superseded / failed — never use** (`--spec_oldcached`, A/B only) |
 
 "Prefix cache" = vision only = `prefixcache`. "Real cache" (committed tokens cached too) =

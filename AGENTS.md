@@ -49,7 +49,9 @@ git clone https://github.com/sgl-project/sglang $SGLANG_SRC && cd $SGLANG_SRC
 git checkout $(cut -c1-40 $DOCR_ROOT/patches/sglang/sglang_BASE_COMMIT.txt)          # v0.5.12 base commit
 git apply $DOCR_ROOT/patches/sglang/sglang_0.5.12_selfspec.patch
 cp -r $DOCR_ROOT/patches/sglang/python .                                            # the new files
-uv venv .venv-sglang --python 3.12 && uv pip install --python .venv-sglang/bin/python -r $DOCR_ROOT/env/sglang_venv_freeze.txt -e $SGLANG_SRC/python
+# torchao / torchaudio / torchvision / torchcodec in the freeze are +cu129 builds: they come from the PyTorch index
+uv venv .venv-sglang --python 3.12 && uv pip install --python .venv-sglang/bin/python -r $DOCR_ROOT/env/sglang_venv_freeze.txt -e $SGLANG_SRC/python \
+    --extra-index-url https://download.pytorch.org/whl/cu129 --index-strategy unsafe-best-match
 
 # serve (MODE=spec = self-speculative, MODE=ar = plain autoregressive, same weights)
 bash serve/serve_sglang_ocr.sh MODE=spec GPU=0 PORT=30500 CKPT=<path or trillionlabs/GravityOCR> CONTEXT=16384 VBIN=$PWD/.venv-sglang/bin
@@ -65,7 +67,8 @@ any OpenAI-compatible endpoint (ours, vLLM, …) with one identical client: `too
 python src/infer_omnidocbench.py --checkpoint <ckpt> --omnidocbench_gt OmniDocBench.json --images_dir <images> \
        --out_dir preds/ --max_long_side 99999 --spec_natcache      # self-spec; drop --spec_natcache for AR
 ```
-`--spec` (prefix cache), `--spec_natcache` (incremental cache) and plain AR produce byte-identical text;
+`--spec` (prefix cache) produces byte-identical text to plain AR; `--spec_natcache` (incremental cache) gives the
+same score, but its bf16 cache can flip a near-tie token now and then;
 see `docs/DECODE_PATHS.md` for what each path caches. Self-speculation needs a checkpoint with a trained
 AR path (`block_diffusion.json: ar_loss_weight > 0`).
 

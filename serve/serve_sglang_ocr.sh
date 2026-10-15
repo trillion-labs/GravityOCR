@@ -30,6 +30,12 @@ HF_CACHE="${HF_HOME:-$HOME/.cache/huggingface}"
 # 4. HF_HUB_OFFLINE=1 -> model is cached; 8 concurrent loads otherwise throttle on unauthenticated HF Hub.
 export PATH=$VBIN:$CUDA_HOME_DIR/bin:$PATH   # $VBIN has ninja; ensure a `ninja` is reachable on any server
 export VLLM_USE_FLASHINFER_SAMPLER=0 CUDA_HOME=$CUDA_HOME_DIR HF_HUB_OFFLINE=1 HF_HOME=$HF_CACHE
+# A hub id (e.g. trillionlabs/GravityOCR) is fetched once here (nothing is downloaded when it is already cached) and served from the
+# local snapshot, so the server itself can stay offline (gotcha 4) and block_diffusion.json supplies the mask id.
+if [ ! -d "$CKPT" ]; then
+  CKPT=$(HF_HUB_OFFLINE=0 $VBIN/python -c 'import sys; from huggingface_hub import snapshot_download; print(snapshot_download(sys.argv[1]))' "$CKPT") \
+    || { echo "[serve] could not fetch the checkpoint from the Hugging Face Hub" >&2; exit 1; }
+fi
 
 MAXREQ_ARG=""; [ -n "${MAXREQ:-}" ] && MAXREQ_ARG="--max-running-requests $MAXREQ"  # raise batching cap (spec defaults to 48)
 # GRAPHBS (opt-in): --cuda-graph-max-bs. Unset = SGLang default (256).

@@ -587,7 +587,9 @@ export VLLM_USE_FLASHINFER_SAMPLER=0   # else the FlashInfer sampler JIT looks f
 export CUDA_HOME=/usr/local/cuda-12.8
 export PATH=<venv>/bin:$PATH           # cuda-graph capture shells out to ninja
 ```
-`env/sglang_venv_freeze.txt` is the tested environment.
+`env/sglang_venv_freeze.txt` is the tested environment. Its torchao / torchaudio / torchvision / torchcodec pins are
+`+cu129` builds from the PyTorch index, so install it with `--extra-index-url https://download.pytorch.org/whl/cu129
+--index-strategy unsafe-best-match` (the exact command is in `AGENTS.md` §2).
 
 ---
 
