@@ -30,7 +30,7 @@ docstring-parser==0.18.0
 einops==0.8.2
 executing==2.2.1
 fastapi==0.138.2
-filelock==3.29.4
+filelock==4.2.1
 flash-attn-4==4.0.0b19
 flashinfer-cubin==0.6.7.post2
 flashinfer-python==0.6.7.post2
