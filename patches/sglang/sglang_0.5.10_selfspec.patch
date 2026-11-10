@@ -14,87 +14,231 @@ index d388d275de0275553439edda3feec259a625c232..b87dce0fc9b9477838d3ab0733cf9716
    "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
    "torchvision",
    "tqdm",
-diff --git a/python/sglang/srt/dllm/config.py b/python/sglang/srt/dllm/config.py
-index edd2049268ac56a9f6ccff16b78bb9ea22c90d0e..720b0d0e5a4fc5e5a147644a7aff0120265eb836 100644
---- a/python/sglang/srt/dllm/config.py
-+++ b/python/sglang/srt/dllm/config.py
-@@ -35,6 +35,7 @@ class DllmConfig:
-             "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
-             "SDARForCausalLM": {"block_size": 4, "mask_id": 151669},
-             "SDARMoeForCausalLM": {"block_size": 4, "mask_id": 151669},
-+            "GlmOcrForConditionalGeneration": {"block_size": 32, "mask_id": 59282},
-         }
+diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
+index aca1adc26f93d2aa9eae6dfcd114be8a9b4c6082..252604a817bea12fbb01e8201f494a8e91811563 100644
+--- a/python/sglang/srt/entrypoints/engine.py
++++ b/python/sglang/srt/entrypoints/engine.py
+@@ -98,6 +98,7 @@ from sglang.srt.utils import (
+     set_prometheus_multiproc_dir,
+     set_ulimit,
+ )
++from sglang.srt.utils.auth import redact_server_args
+ from sglang.srt.utils.network import get_zmq_socket, is_port_available
+ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+ from sglang.srt.utils.watchdog import SubprocessWatchdog
+@@ -836,12 +837,19 @@ class Engine(EngineScoreMixin, EngineBase):
+         internal_states = self.loop.run_until_complete(
+             self.tokenizer_manager.get_internal_state()
+         )
+-        return {
+-            **dataclasses.asdict(self.tokenizer_manager.server_args),
+-            **self._scheduler_init_result.scheduler_infos[0],
+-            "internal_states": internal_states,
+-            "version": __version__,
+-        }
++        # Secrets (API keys, SSL key password) are redacted, as in /server_info.
++        info = redact_server_args(
++            {
++                **dataclasses.asdict(self.tokenizer_manager.server_args),
++                **self._scheduler_init_result.scheduler_infos[0],
++            }
++        )
++        info["internal_states"] = [
++            redact_server_args(state) if isinstance(state, dict) else state
++            for state in internal_states
++        ]
++        info["version"] = __version__
++        return info
  
-         arch = model_config.hf_config.architectures[0]
-diff --git a/python/sglang/srt/dllm/mixin/req.py b/python/sglang/srt/dllm/mixin/req.py
-index 720b9d1db162fcef48eee7e0e4593cd6bb008084..88c07ad244a82c8f7657946be47e46351cc12af0 100644
---- a/python/sglang/srt/dllm/mixin/req.py
-+++ b/python/sglang/srt/dllm/mixin/req.py
-@@ -67,8 +67,9 @@ class ReqDllmMixin:
+     def init_weights_update_group(
+         self,
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 6978e0c062e897f0680bf25c14524d3813647efc..0504b4311a85e01bc494a34bc055bb3d8fa126ff 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -72,6 +72,12 @@ from sglang.srt.entrypoints.engine import (
+     run_detokenizer_process,
+     run_scheduler_process,
+ )
++from sglang.srt.entrypoints.http_worker_keys import (
++    AuthKeys,
++    AuthKeysWorkerTarget,
++    get_auth_keys,
++    set_auth_keys,
++)
+ from sglang.srt.entrypoints.ollama.protocol import (
+     OllamaChatRequest,
+     OllamaGenerateRequest,
+@@ -168,7 +174,13 @@ from sglang.srt.utils import (
+     kill_process_tree,
+     set_uvicorn_logging_configs,
+ )
+-from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
++from sglang.srt.utils.auth import (
++    AuthLevel,
++    auth_level,
++    install_auth_middleware,
++    redact_server_args,
++    server_args_without_secrets,
++)
+ from sglang.srt.utils.json_response import (
+     SGLangORJSONResponse,
+     dumps_json,
+@@ -220,10 +232,17 @@ async def init_multi_tokenizer() -> ServerArgs:
+     server_args: ServerArgs
+     port_args: PortArgs
  
-     def _update_block_offset_for_dllm(self):
-         prefix_len = len(self.prefix_indices)
--        assert (
--            prefix_len % self.dllm_config.block_size == 0
--        ), f"Unexpected prefix len: {prefix_len}"
-+        # SLIDE self-spec commits a VARIABLE number of accepted tokens per round, so the committed
-+        # prefix is no longer block_size-aligned (lockstep diffusion always advanced by block_size).
-+        # The block is rebuilt from origin+output each round regardless, so a non-aligned prefix is
-+        # fine; only this sanity assert needed relaxing.
-         if prefix_len > self.dllm_block_offset:
-             self.dllm_block_offset = prefix_len
-diff --git a/python/sglang/srt/dllm/mixin/scheduler.py b/python/sglang/srt/dllm/mixin/scheduler.py
-index 3524d40aa0daf456582a8076f9e3f48265b50c9e..4097c1f6319725226719bcf0792c8ed0a91ed619 100644
---- a/python/sglang/srt/dllm/mixin/scheduler.py
-+++ b/python/sglang/srt/dllm/mixin/scheduler.py
-@@ -1,8 +1,11 @@
- from __future__ import annotations
+-    # API key authentication is not supported in multi-tokenizer mode
+-    assert (
+-        server_args.api_key is None
+-    ), "API key is not supported in multi-tokenizer mode"
++    # The shared-memory copy carries no secrets. This worker's keys were set by its uvicorn worker
++    # target (AuthKeysWorkerTarget, see _run_uvicorn_workers) before it started; put them back so the
++    # warmup request and the handlers that check server_args see the same keys as the middleware.
++    keys = get_auth_keys()
++    if keys is None:
++        raise RuntimeError(
++            "multi-tokenizer worker started without its API keys; start the workers through "
++            "_run_uvicorn_workers so that every worker enforces the server's keys"
++        )
++    server_args.api_key = keys.api_key
++    server_args.admin_api_key = keys.admin_api_key
  
- import logging
-+import os
- from typing import TYPE_CHECKING, List, Optional, Set, Union
+     # Create a new ipc name for the current process
+     port_args.tokenizer_ipc_name = (
+@@ -231,7 +250,9 @@ async def init_multi_tokenizer() -> ServerArgs:
+     )
+     logger.info(
+         f"Start multi-tokenizer worker process {os.getpid()}, "
+-        f"ipc_name={port_args.tokenizer_ipc_name}"
++        f"ipc_name={port_args.tokenizer_ipc_name}, "
++        f"api_key {'set' if keys.api_key else 'unset'}, "
++        f"admin_api_key {'set' if keys.admin_api_key else 'unset'}"
+     )
  
-+_SELFSPEC_SLIDE = os.environ.get("SELFSPEC_SLIDE", "0") == "1"
+     # Launch multi-tokenizer manager process
+@@ -382,6 +403,11 @@ app.add_middleware(
+     allow_methods=["*"],
+     allow_headers=["*"],
+ )
++# API-key auth (normal / admin_optional / admin_force endpoints). Added here, on the module-level app,
++# so every tokenizer worker process has it: with --tokenizer-worker-num > 1 each worker imports this
++# module and serves its own `app`, and Starlette accepts middleware only before the app starts. The
++# middleware reads the keys set by set_auth_keys() in its own process and answers 503 until they are set.
++install_auth_middleware(app, keys=get_auth_keys)
+ 
+ # Include routers
+ from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
+@@ -610,12 +636,20 @@ async def server_info():
+     if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
+         del _global_state.tokenizer_manager.server_args.model_config
+ 
+-    return {
+-        **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
+-        **_global_state.scheduler_info,
+-        "internal_states": internal_states,
+-        "version": __version__,
+-    }
++    # Secrets (API keys, SSL key password) are redacted: this endpoint is NORMAL auth level, so any
++    # caller of the normal API (any local user when the server has no API key) can read it.
++    info = redact_server_args(
++        {
++            **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
++            **_global_state.scheduler_info,
++        }
++    )
++    info["internal_states"] = [
++        redact_server_args(state) if isinstance(state, dict) else state
++        for state in internal_states
++    ]
++    info["version"] = __version__
++    return info
+ 
+ 
+ @app.get("/get_load")
+@@ -2001,31 +2035,20 @@ def _setup_and_run_http_server(
+             execute_warmup_func=execute_warmup_func,
+         )
+ 
+-        # Add api key authorization
+-        # This is only supported in single tokenizer mode.
+-        #
++        # API key authorization: the module-level auth middleware enforces these keys.
+         # Backward compatibility:
+         # - api_key only: behavior matches legacy (all endpoints require api_key)
+         # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
+         #   admin_api_key is not configured.
+-        if (
+-            server_args.api_key
+-            or server_args.admin_api_key
+-            or app_has_admin_force_endpoints(app)
+-        ):
+-            from sglang.srt.utils.auth import add_api_key_middleware
+-
+-            add_api_key_middleware(
+-                app,
+-                api_key=server_args.api_key,
+-                admin_api_key=server_args.admin_api_key,
+-            )
++        set_auth_keys(server_args.api_key, server_args.admin_api_key)
+     else:
+         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
+-        # for other worker processes to read.
++        # for other worker processes to read. Without the secrets: the segment is a file in
++        # /dev/shm that outlives a killed server. The workers get the keys from their uvicorn
++        # worker target instead (_run_uvicorn_workers).
+         app.is_single_tokenizer_mode = False
+         multi_tokenizer_args_shm = write_data_for_multi_tokenizer(
+-            port_args, server_args, scheduler_infos[0]
++            port_args, server_args_without_secrets(server_args), scheduler_infos[0]
+         )
+ 
+     try:
+@@ -2110,8 +2133,12 @@ def _setup_and_run_http_server(
+                     "SSL refresh will be disabled."
+                 )
+ 
+-            uvicorn.run(
++            _run_uvicorn_workers(
+                 "sglang.srt.entrypoints.http_server:app",
++                AuthKeys(
++                    api_key=server_args.api_key,
++                    admin_api_key=server_args.admin_api_key,
++                ),
+                 host=server_args.host,
+                 port=server_args.port,
+                 root_path=server_args.fastapi_root_path,
+@@ -2132,6 +2159,28 @@ def _setup_and_run_http_server(
+                 _global_state.tokenizer_manager.socket_mapping.clear_all_sockets()
+ 
+ 
++def _run_uvicorn_workers(app_import_path: str, auth_keys: AuthKeys, **config_kwargs):
++    """`uvicorn.run(app_import_path, workers=N, **config_kwargs)` (its multi-worker branch), except
++    that the worker target is wrapped in AuthKeysWorkerTarget: uvicorn pickles the target to every
++    worker process it spawns (and to every worker it restarts), so each worker sets the server's keys
++    before it serves, and the keys never pass through shared memory or the environment."""
++    from uvicorn import Config, Server
++    from uvicorn.supervisors import Multiprocess
 +
- from sglang.srt.dllm.config import DllmConfig
- from sglang.srt.dllm.mixin.req import DllmReqPhase
- from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-@@ -79,13 +82,32 @@ class SchedulerDllmMixin:
-                 if new_tokens == 0:
-                     continue
- 
--                req.fill_ids[-new_tokens:] = next_token_ids[:]
-+                # Write accepted tokens to their FORWARDED positions (right after committed output =
-+                # front of this round's block), not the block end. For lockstep full-block commit
-+                # wp+new_tokens lands at the block end (== fill_ids[-new_tokens:]); for SLIDE
-+                # (variable accept < block_size) it lands at the front, matching the KV written for
-+                # those positions so the next-round radix match advances by exactly accept count.
-+                wp = len(req.origin_input_ids) + len(req.output_ids)
-+                req.fill_ids[wp:wp + new_tokens] = next_token_ids[:]
-                 self.num_generated_tokens += new_tokens
- 
-                 req.output_ids.extend(next_token_ids)
-                 req.check_finished(new_accepted_len=new_tokens)
- 
-                 if req.finished():
-+                    # dllm SLIDE: the FINAL block occupied req_to_token[wp : wp+block_size] but only
-+                    # the accepted prefix [wp : wp+new_tokens] was committed. release_kv_cache frees
-+                    # up to seq_len (== wp+new_tokens); the rejected tail [wp+new_tokens : wp+block_size]
-+                    # is beyond it and orphans ("token_to_kv_pool_allocator memory leak detected").
-+                    # Free it here. (Per-round/unfinished blocks DON'T leak — the next round's block
-+                    # starts at wp+new_tokens and REUSES those exact slots, so freeing them mid-stream
-+                    # would corrupt the live KV and collapse accept.)
-+                    if _SELFSPEC_SLIDE:
-+                        bsz = req.dllm_config.block_size
-+                        rt = self.req_to_token_pool.req_to_token[req.req_pool_idx]
-+                        tail = rt[wp + new_tokens : wp + bsz]
-+                        if tail.numel() > 0:
-+                            self.token_to_kv_pool_allocator.free(tail)
-                     release_kv_cache(req, self.tree_cache)
-                     req.time_stats.set_completion_time()
- 
++    config = Config(app_import_path, **config_kwargs)
++    assert config.workers > 1, "_run_uvicorn_workers is for --tokenizer-worker-num > 1"
++    server = Server(config=config)
++    sock = config.bind_socket()
++    try:
++        Multiprocess(
++            config,
++            target=AuthKeysWorkerTarget(server.run, auth_keys),
++            sockets=[sock],
++        ).run()
++    except KeyboardInterrupt:
++        pass
++
++
+ def launch_server(
+     server_args: ServerArgs,
+     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
 diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
-index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d2644d021 100644
+index 4fe8aec313015ecd0f10d13a8e532746582bbf63..40b4ce646ec07561766a45a833bb79e7ca00ca93 100644
 --- a/python/sglang/srt/layers/attention/flashinfer_backend.py
 +++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
 @@ -16,6 +16,10 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
@@ -124,7 +268,7 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d
  
  
  # Reuse this workspace buffer across all flashinfer wrappers
-@@ -137,6 +150,27 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -137,6 +150,29 @@ class FlashInferAttnBackend(AttentionBackend):
          # FIXME: remove dllm workarounds from flashinfer
          self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
          self.is_dllm_model = self.dllm_config is not None
@@ -143,16 +287,18 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d
 +        self.selfspec_nomask = self.is_selfspec and os.environ.get("SELFSPEC_NOMASK", "0") == "1"
 +        # SELFSPEC_FASTATTN=1: mask-free + sync-free draft/verify attention (speculative/selfspec_fast_attn.py).
 +        # Built after the wrappers/updaters below (needs indices_updater_prefill); default OFF = the old custom-mask path unchanged.
-+        from sglang.srt.speculative.selfspec_fast_attn import fastattn_enabled as _ss_fastattn_enabled
++        self.selfspec_fast = False
++        if self.is_selfspec:
++            from sglang.srt.speculative.selfspec_fast_attn import fastattn_enabled as _ss_fastattn_enabled
 +
-+        self.selfspec_fast = bool(self.is_selfspec and _ss_fastattn_enabled() and not skip_prefill)
++            self.selfspec_fast = bool(_ss_fastattn_enabled() and not skip_prefill)
 +        if self.selfspec_fast and self.selfspec_nomask:
 +            raise ValueError("SELFSPEC_FASTATTN=1 and SELFSPEC_NOMASK=1 are mutually exclusive")
 +        self.ss_planner = None
  
          # Parse constants
          self.decode_use_tensor_cores = should_use_tensor_core(
-@@ -305,6 +339,17 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -305,6 +341,17 @@ class FlashInferAttnBackend(AttentionBackend):
          self.prefill_cuda_graph_metadata = {}  # For verify
          self.draft_extend_cuda_graph_metadata = {}  # For draft extend
  
@@ -170,7 +316,7 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d
      def _process_multi_item_scoring(
          self, forward_batch: ForwardBatch
      ) -> MultiItemScoringParams:
-@@ -456,6 +501,30 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -456,6 +503,30 @@ class FlashInferAttnBackend(AttentionBackend):
              self.forward_metadata = PrefillMetadata(
                  self.prefill_wrappers_paged, False, False
              )
@@ -201,7 +347,7 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d
          elif forward_batch.forward_mode.is_target_verify():
              self.indices_updater_prefill.update(
                  forward_batch.req_pool_indices,
-@@ -595,6 +664,9 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -595,6 +666,9 @@ class FlashInferAttnBackend(AttentionBackend):
                  decode_wrappers[i].begin_forward = partial(
                      fast_decode_plan, decode_wrappers[i]
                  )
@@ -211,7 +357,7 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d
          elif forward_mode.is_target_verify():
              prefill_wrappers = []
              for i in range(self.num_wrappers):
-@@ -608,8 +680,19 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -608,8 +682,19 @@ class FlashInferAttnBackend(AttentionBackend):
                          paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                          paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                          paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
@@ -233,7 +379,7 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d
                      )
                  )
              seq_lens_sum = seq_lens.sum().item()
-@@ -711,6 +794,11 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -711,6 +796,11 @@ class FlashInferAttnBackend(AttentionBackend):
                  fixed_split_size=None,
                  disable_split_kv=self.disable_cuda_graph_kv_split,
              )
@@ -245,23 +391,24 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d
          elif forward_mode.is_target_verify():
              self.indices_updater_prefill.update(
                  req_pool_indices[:bs],
-@@ -783,10 +871,24 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -783,10 +873,25 @@ class FlashInferAttnBackend(AttentionBackend):
                          layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                      )
  
-+            # SELF-SPEC (block-diffusion) on multimodal dllm: use_ragged=False so the block goes
-+            # through THIS paged wrapper. causal=False -> block queries attend to the WHOLE KV
-+            # (committed prefix + all block positions) = [committed causal-in-KV | block BIDIR] =
-+            # natcache DRAFT mask. causal=True -> block-internal causal = VERIFY mask. Per-forward
-+            # via forward_batch.dllm_ragged_causal (default False=bidir; algorithm sets True to verify).
 +            paged_causal = not layer.is_cross_attention
-+            if self.is_dllm_model or self.selfspec_nomask:
-+                paged_causal = bool(getattr(forward_batch, "dllm_ragged_causal", False))
-+            # SELFSPEC_FASTATTN: verify = CAUSAL; draft = NON_CAUSAL here (mask rows), then the same plan CAUSAL below with
-+            # its row 0 (seed) copied into row 0. One request per sequence, as before; the wrapper has no custom mask.
-+            _ssc = getattr(self.forward_metadata, "ss_causal", None)
-+            if _ssc is not None:
-+                paged_causal = _ssc
++            if self.is_selfspec:
++                # Self-spec servers only (every other model, dLLMs included, keeps upstream's causal flag).
++                # SELFSPEC_NOMASK=1: the block goes through this paged wrapper without a mask; causal=False -> block
++                # queries attend to the whole KV (committed prefix + all block positions) = the DRAFT mask, causal=True
++                # -> block-internal causal = the VERIFY mask. Per forward via forward_batch.dllm_ragged_causal (set from
++                # spec_info.selfspec_causal in ForwardBatch.init_new).
++                if self.selfspec_nomask:
++                    paged_causal = bool(getattr(forward_batch, "dllm_ragged_causal", False))
++                # SELFSPEC_FASTATTN: verify = CAUSAL; draft = NON_CAUSAL here (mask rows), then the same plan CAUSAL below with
++                # its row 0 (seed) copied into row 0. One request per sequence, as before; the wrapper has no custom mask.
++                _ssc = getattr(self.forward_metadata, "ss_causal", None)
++                if _ssc is not None:
++                    paged_causal = _ssc
 +
              o = prefill_wrapper_paged.forward(
                  q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -271,13 +418,13 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d
                  sm_scale=layer.scaling,
                  # Disable sliding window attention for multi-item scoring:
                  # - Sliding window could cut across item boundaries, breaking semantic coherence
-@@ -807,6 +909,39 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -807,6 +912,39 @@ class FlashInferAttnBackend(AttentionBackend):
                  k_scale=layer.k_scale_float,
                  v_scale=layer.v_scale_float,
              )
 +            # SELFSPEC_FASTATTN draft: the NON_CAUSAL run above is right for the mask rows; the seed row (row 0 of every
 +            # K-row window) must see prefix + seed only -> run the same plan CAUSAL (row 0's causal view is exactly that) and copy it.
-+            if getattr(self.forward_metadata, "ss_seed_causal", False):
++            if self.is_selfspec and getattr(self.forward_metadata, "ss_seed_causal", False):
 +                _K = self.forward_metadata.ss_K
 +                o_c = prefill_wrapper_paged.forward(
 +                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -291,7 +438,7 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d
 +                )
 +                _o4 = o.view(-1, _K, layer.tp_q_head_num, layer.head_dim)
 +                _o4[:, 0].copy_(o_c.view(-1, _K, layer.tp_q_head_num, layer.head_dim)[:, 0])
-+            _shw = getattr(self.forward_metadata, "ss_shadow", None)
++            _shw = getattr(self.forward_metadata, "ss_shadow", None) if self.is_selfspec else None
 +            if _shw is not None:
 +                # SELFSPEC_SHADOW=1: the old custom-mask path on the same q / KV (MaskMode kCustom: the wrapper was planned
 +                # with the worker's old mask, so the causal flag is ignored exactly as in the old path)
@@ -311,39 +458,23 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d
          else:
              # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
              # `forward_batch.token_to_kv_pool` for this layer. This enables attention over
-@@ -823,6 +958,12 @@ class FlashInferAttnBackend(AttentionBackend):
-                 causal = False
-             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
-                 save_kv_cache = False
-+            # SELF-SPEC / dllm (block-diffusion): per-forward control of the block-internal (ragged)
-+            # mask. DRAFT -> bidir block (causal=False); VERIFY -> causal block (causal=True). The
-+            # committed/prefix (paged) part is always causal=False (token-causal KV store), so the
-+            # effective mask is [committed token-causal | block (bidir|causal)] as natcache.
-+            if self.is_dllm_model:
-+                causal = bool(getattr(forward_batch, "dllm_ragged_causal", False))
- 
-             if self.forward_metadata.extend_no_prefix:
-                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
-@@ -1267,6 +1408,7 @@ class FlashInferIndicesUpdaterPrefill:
-             self.qo_indptr[0],
-             use_ragged,
-             spec_info,
-+            seq_lens_cpu=seq_lens_cpu,
-             fixed_split_size=fixed_split_size,
-             multi_item_params=multi_item_params,
-         )
-@@ -1379,6 +1521,7 @@ class FlashInferIndicesUpdaterPrefill:
-         use_sliding_window_kv_pool: bool = False,
-         fixed_split_size: Optional[int] = None,
-         multi_item_params: Optional[MultiItemScoringParams] = None,
-+        seq_lens_cpu: Optional[torch.Tensor] = None,
-     ):
-         bs = len(seq_lens)
-         if spec_info is None:
-@@ -1490,6 +1633,11 @@ class FlashInferIndicesUpdaterPrefill:
+@@ -1490,6 +1628,24 @@ class FlashInferIndicesUpdaterPrefill:
              token_pos_in_items_len = 0
              max_item_len_ptr = None
  
++        # Self-spec verify/draft plans (spec_info is only set on TARGET_VERIFY here; SELFSPEC_DIFFUSION servers only):
++        #   default: flashinfer's split heuristic; at bs=1 its KV chunk is 128 until kv ~3.3k, then grows with the
++        #     request's TOTAL kv length -> chunk boundaries (merge order) depend on where the (K+1)-token window starts,
++        #     so beyond ~3.3k a token's logits depend on the draft's accept pattern at the bf16-rounding level.
++        #   SELFSPEC_VERIFY_FIXED_SPLIT=<n>: fixed chunk n (boundaries at multiples of n, independent of window).
++        #   SELFSPEC_VERIFY_NO_SPLIT=1: no split — worse: window-dependent from early in the sequence.
++        # Unset (default), and on every other server, plan() gets upstream's arguments.
++        split_kwargs = {"fixed_split_size": fixed_split_size}
++        if spec_info is not None and self.attn_backend.is_selfspec:
++            if _SELFSPEC_VERIFY_FIXED_SPLIT:
++                split_kwargs["fixed_split_size"] = _SELFSPEC_VERIFY_FIXED_SPLIT
++            if _SELFSPEC_VERIFY_NO_SPLIT:
++                split_kwargs["disable_split_kv"] = True
 +        # Note: the two blocking D2H copies in plan() (paged_kv_indptr / last_page_len .to("cpu"))
 +        # cannot be skipped via the max_sequence_kv argument because of a flashinfer bug: with that
 +        # argument the paged_kv_indptr_host assignment is skipped but a later line still references
@@ -352,49 +483,42 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..1eace260f4888bb8ac0769ab0cd2969d
          wrapper_paged.begin_forward(
              qo_indptr,
              kv_indptr,
-@@ -1503,7 +1651,15 @@ class FlashInferIndicesUpdaterPrefill:
+@@ -1503,7 +1659,7 @@ class FlashInferIndicesUpdaterPrefill:
              kv_data_type=self.data_type,
              custom_mask=use_custom_mask,
              non_blocking=True,
 -            fixed_split_size=fixed_split_size,
-+            # Self-spec verify/draft plans (spec_info is only set on TARGET_VERIFY here):
-+            #   default: flashinfer's split heuristic; at bs=1 its KV chunk is 128 until kv ~3.3k, then grows with the
-+            #     request's TOTAL kv length -> chunk boundaries (merge order) depend on where the (K+1)-token window starts,
-+            #     so beyond ~3.3k a token's logits depend on the draft's accept pattern at the bf16-rounding level.
-+            #   SELFSPEC_VERIFY_FIXED_SPLIT=<n>: fixed chunk n (boundaries at multiples of n, independent of window).
-+            #   SELFSPEC_VERIFY_NO_SPLIT=1: no split — worse: window-dependent from early in the sequence.
-+            fixed_split_size=(_SELFSPEC_VERIFY_FIXED_SPLIT if (spec_info is not None and _SELFSPEC_VERIFY_FIXED_SPLIT)
-+                              else fixed_split_size),
-+            disable_split_kv=bool(spec_info is not None and _SELFSPEC_VERIFY_NO_SPLIT),
++            **split_kwargs,
              prefix_len_ptr=prefix_len_ptr,
              token_pos_in_items_ptr=token_pos_in_items_ptr,
              token_pos_in_items_len=token_pos_in_items_len,
 diff --git a/python/sglang/srt/layers/attention/vision.py b/python/sglang/srt/layers/attention/vision.py
-index 3fd45aac0101cb96c892bd9137e8f83ce76695fa..36b928e79e787e37efab8f6fa04e73e28b9226ba 100644
+index 3fd45aac0101cb96c892bd9137e8f83ce76695fa..63cfaccf08cd50af7997b9337365d5f77086d8a2 100644
 --- a/python/sglang/srt/layers/attention/vision.py
 +++ b/python/sglang/srt/layers/attention/vision.py
-@@ -3,6 +3,7 @@ from __future__ import annotations
- import dataclasses
- import functools
- import math
-+import os
- from functools import lru_cache, partial
- from typing import Any, Callable, Optional, Tuple
+@@ -73,6 +73,7 @@ from sglang.srt.layers.linear import (
+ )
+ from sglang.srt.layers.quantization import QuantizationConfig
+ from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
++from sglang.srt.multimodal.glm_vit_graph_runner import glm_vit_graph_maxm
+ from sglang.srt.server_args import get_global_server_args
+ from sglang.srt.utils import add_prefix, get_bool_env_var
  
-@@ -377,6 +378,12 @@ class VisionTritonAttention(nn.Module):
+@@ -377,6 +378,13 @@ class VisionTritonAttention(nn.Module):
          return output
  
  
 +# With SS_GLM_VIT_GRAPH_MAXM>0 (default off) the GLM ViT passes cu_seqlens as the list [cu_gpu, max_seqlen]
 +# (graph replay and its eager fallback); FA3 then takes the list path per call instead of per the global
 +# SGLANG_VIT_ENABLE_CUDA_GRAPH env. Off: this bool is False and the dispatch below is the original one.
-+_SS_VIT_LIST = int(os.environ.get("SS_GLM_VIT_GRAPH_MAXM", "0") or 0) > 0
++# The variable is parsed by the ViT graph runner's strict parser (a malformed value raises ValueError naming it).
++_SS_VIT_LIST = glm_vit_graph_maxm() > 0
 +
 +
  class VisionFlash3Attention(nn.Module):
      def __init__(
          self,
-@@ -406,7 +413,9 @@ class VisionFlash3Attention(nn.Module):
+@@ -406,7 +414,9 @@ class VisionFlash3Attention(nn.Module):
          Returns:
               [b * s, h, head_size]
          """
@@ -405,6 +529,102 @@ index 3fd45aac0101cb96c892bd9137e8f83ce76695fa..36b928e79e787e37efab8f6fa04e73e2
              max_seqlen = cu_seqlens[1]
              output = flash_attn_func(
                  q,
+diff --git a/python/sglang/srt/managers/multi_tokenizer_mixin.py b/python/sglang/srt/managers/multi_tokenizer_mixin.py
+index e0a1669fb3e687435630008c421dde51443cd8ab..32f26d2024eeaed604bdaa4a49baa65687adf7b9 100644
+--- a/python/sglang/srt/managers/multi_tokenizer_mixin.py
++++ b/python/sglang/srt/managers/multi_tokenizer_mixin.py
+@@ -24,6 +24,7 @@ import logging
+ import multiprocessing as multiprocessing
+ import os
+ import pickle
++import stat
+ import sys
+ import threading
+ from functools import partialmethod
+@@ -437,20 +438,52 @@ def get_main_process_id() -> int:
+     return multiprocessing.current_process()._parent_pid
+ 
+ 
++# Linux keeps POSIX shared memory objects as files in this directory (mode 1777: any user can create names).
++_SHM_DIR = "/dev/shm"
++
++
++def _remove_own_stale_segment(name: str) -> None:
++    """Unlink an existing segment `name` that this user owns (a leftover of an earlier, killed process
++    with the same pid); refuse one that belongs to anyone else."""
++    path = os.path.join(_SHM_DIR, name)
++    try:
++        st = os.lstat(path)
++    except FileNotFoundError:
++        return  # gone meanwhile, or not a Linux /dev/shm: the exclusive create decides
++    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
++        raise PermissionError(
++            f"Shared memory segment {path} already exists and belongs to uid {st.st_uid}, not to this "
++            f"user; refusing to use it (whoever created it could read the server arguments or replace "
++            f"them before the tokenizer workers unpickle them)"
++        )
++    logger.warning(f"Removing stale shared memory segment {path} left by an earlier process")
++    os.unlink(path)
++
++
++def _check_own_segment(shm: shared_memory.SharedMemory, name: str) -> None:
++    """Refuse a segment this user did not create with write_to_shared_memory (owner + mode 0600)."""
++    fd = getattr(shm, "_fd", -1)
++    st = os.fstat(fd) if fd >= 0 else os.stat(os.path.join(_SHM_DIR, name))
++    if st.st_uid != os.geteuid() or st.st_mode & 0o077:
++        raise PermissionError(
++            f"Shared memory segment {name} belongs to uid {st.st_uid} with mode "
++            f"{stat.S_IMODE(st.st_mode):o}; refusing to unpickle it"
++        )
++
++
+ def write_to_shared_memory(obj, name: str) -> shared_memory.SharedMemory:
+-    """Write data to shared memory"""
++    """Write data to a new shared memory segment that only this user can open.
++
++    The segment is always created exclusively (O_CREAT | O_EXCL, mode 0600). An existing segment with
++    the same name is never written to: any local user can create a name in /dev/shm in advance, then
++    read what is written into it or replace it before a reader unpickles it.
++    """
+     serialized = pickle.dumps(obj)
+     size = len(serialized)
+     try:
+-        # Try to open existing shared memory
+-        shm = shared_memory.SharedMemory(name=name)
+-        # If size is insufficient, close and recreate
+-        if shm.size < size:
+-            shm.close()
+-            shm.unlink()
+-            shm = shared_memory.SharedMemory(create=True, size=size, name=name)
+-    except FileNotFoundError:
+-        # If not present, create new shared memory
++        shm = shared_memory.SharedMemory(create=True, size=size, name=name)
++    except FileExistsError:
++        _remove_own_stale_segment(name)
+         shm = shared_memory.SharedMemory(create=True, size=size, name=name)
+ 
+     shm.buf[:size] = serialized
+@@ -458,14 +491,16 @@ def write_to_shared_memory(obj, name: str) -> shared_memory.SharedMemory:
+ 
+ 
+ def read_from_shared_memory(name: str) -> Any:
+-    """Read data from shared memory"""
++    """Read data written by write_to_shared_memory (in a segment this user owns)."""
+     try:
+         shm = shared_memory.SharedMemory(name=name)
+-        data = pickle.loads(bytes(shm.buf))
+-        shm.close()
+-        return data
+     except FileNotFoundError:
+         raise FileNotFoundError(f"Shared memory {name} not found")
++    try:
++        _check_own_segment(shm, name)
++        return pickle.loads(bytes(shm.buf))
++    finally:
++        shm.close()
+ 
+ 
+ def write_data_for_multi_tokenizer(
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
 index 0b26be6c6d180fd608492333e5f3a602d8bc1c4b..8c32ba1ee11eafb65e42006f4118b8af1dd510c7 100644
 --- a/python/sglang/srt/managers/schedule_batch.py
@@ -461,74 +681,19 @@ index 0b26be6c6d180fd608492333e5f3a602d8bc1c4b..8c32ba1ee11eafb65e42006f4118b8af
  
          if self.output_ids is not None:
              self.output_ids = self.output_ids[keep_indices_device]
-diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
-index 2cce30600ab2108c04fb80623813c129d0a0281e..c18b5e6ee1f3f92f5dd7422bfd5890c5032fbce5 100644
---- a/python/sglang/srt/managers/schedule_policy.py
-+++ b/python/sglang/srt/managers/schedule_policy.py
-@@ -546,15 +546,38 @@ class PrefillAdder:
- 
-         return _rem_tokens
- 
-+    def _dllm_trunc_len(self, req: Req, prefix_len: int) -> int:
-+        # DECODE: one block (block_size) per step — the diffusion block is the decode unit.
-+        # PREFILL: the prompt is plain causal context (the algorithm runs the prefill forward with
-+        # dllm_ragged_causal=True), so process the WHOLE remaining prompt in ONE forward, capped only
-+        # by the chunked-prefill / memory budget. The old `min(rem_dllm_tokens, block_size)` capped
-+        # prefill at block_size too -> a 3840-token prompt took ~120 eager forwards AND re-ran
-+        # the vision encoder per chunk. The trailing decode masks are excluded (only origin+output is
-+        # causal); processing the full prompt at once also makes the first decode block start==0.
-+        if not req.is_dllm_prefill():
-+            return (
-+                min(self.rem_dllm_tokens, self.dllm_block_size)
-+                // self.page_size
-+                * self.page_size
-+            )
-+        remaining_prompt = len(req.origin_input_ids) + len(req.output_ids) - prefix_len
-+        budget = min(int(self.rem_total_tokens), self.rem_input_tokens)
-+        if self.rem_chunk_tokens is not None:
-+            budget = min(budget, self.rem_chunk_tokens)  # chunked-prefill budget
-+        # Safety cap (env-tunable): a single very large prefill forward can hit an illegal memory
-+        # access on this multimodal dllm path (mrope/workspace). Capping at e.g. 512 still collapses
-+        # ~120 block_size(32) forwards into ~N/512, the bulk of the win, while staying stable.
-+        import os as _os
-+        _cap = int(_os.environ.get("DLLM_PREFILL_CHUNK", "512"))
-+        budget = min(budget, _cap)
-+        n = min(remaining_prompt, budget) // self.page_size * self.page_size
-+        return max(n, self.dllm_block_size)
-+
-     def _add_dllm_req(self, req: Req, prefix_len: int):
-         # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
-         # the diffusion unmask process may have some problems
-         # Make sure at least one page is available
--        trunc_len = (
--            min(self.rem_dllm_tokens, self.dllm_block_size)
--            // self.page_size
--            * self.page_size
--        )
-+        trunc_len = self._dllm_trunc_len(req, prefix_len)
- 
-         req.extend_input_len = trunc_len
-         req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
-@@ -570,7 +593,13 @@ class PrefillAdder:
- 
-     def add_dllm_staging_req(self, req: Req):
-         assert self.dllm_config is not None
--        _rem_tokens = self._get_dllm_remain_tokens()
-+        # PREFILL continuation (prompt > chunked_prefill_size): take the whole remaining prompt, not
-+        # a block_size chunk. DECODE: one block as before.
-+        _rem_tokens = (
-+            self._dllm_trunc_len(req, len(req.prefix_indices))
-+            if req.is_dllm_prefill()
-+            else self._get_dllm_remain_tokens()
-+        )
- 
-         if _rem_tokens <= 0:
-             return AddReqResult.NO_TOKEN
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 67af2d0de9436b00d33ed05e76723aaac0ae0739..9690b51440f4ac6b585cb96fa997064302e15a5a 100644
+index 67af2d0de9436b00d33ed05e76723aaac0ae0739..c9cd09ac442971bdcaa01066c1b3b4772d0940c0 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
-@@ -627,6 +627,10 @@ class Scheduler(
+@@ -219,6 +219,7 @@ from sglang.srt.utils import (
+     set_random_seed,
+     suppress_other_loggers,
+ )
++from sglang.srt.utils.auth import redact_server_args
+ from sglang.srt.utils.common import is_npu
+ from sglang.srt.utils.hf_transformers_utils import (
+     get_processor,
+@@ -627,6 +628,10 @@ class Scheduler(
  
          DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
          self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
@@ -539,7 +704,7 @@ index 67af2d0de9436b00d33ed05e76723aaac0ae0739..9690b51440f4ac6b585cb96fa9970643
  
      def init_model_worker(self):
          self.init_tp_model_worker()
-@@ -984,7 +988,11 @@ class Scheduler(
+@@ -984,7 +989,11 @@ class Scheduler(
              self.server_args.disaggregation_transfer_backend
          )
  
@@ -552,7 +717,7 @@ index 67af2d0de9436b00d33ed05e76723aaac0ae0739..9690b51440f4ac6b585cb96fa9970643
              draft_token_to_kv_pool = None
          elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
              if self.server_args.enable_multi_layer_eagle:
-@@ -2374,6 +2382,11 @@ class Scheduler(
+@@ -2374,6 +2383,11 @@ class Scheduler(
              if dynamic_size is not None:
                  chunked_prefill_size = dynamic_size
  
@@ -564,7 +729,27 @@ index 67af2d0de9436b00d33ed05e76723aaac0ae0739..9690b51440f4ac6b585cb96fa9970643
          # Prefill policy
          adder = PrefillAdder(
              self.page_size,
-@@ -3258,7 +3271,13 @@ class Scheduler(
+@@ -3066,7 +3080,9 @@ class Scheduler(
+         return success
+ 
+     def get_internal_state(self, recv_req: GetInternalStateReq):
+-        ret = vars(get_global_server_args())
++        # A copy without the secrets: the result is served by /server_info, and the live server args
++        # must not gain the fields added below (nor lose model_config).
++        ret = redact_server_args(vars(get_global_server_args()))
+         ret["last_gen_throughput"] = self.last_gen_throughput
+         ret["memory_usage"] = {
+             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
+@@ -3128,7 +3144,7 @@ class Scheduler(
+             logger.info(f"Global server args updated! {get_global_server_args()=}")
+         return SetInternalStateReqOutput(
+             updated=True,
+-            server_args=vars(get_global_server_args()),
++            server_args=redact_server_args(vars(get_global_server_args())),
+         )
+ 
+     def handle_rpc_request(self, recv_req: RpcReqInput):
+@@ -3258,7 +3274,13 @@ class Scheduler(
      def _pause_engine(self) -> Tuple[List[Req], int]:
          raise NotImplementedError()
  
@@ -642,29 +827,59 @@ index abcda6794674b71336f19a865f0da1b979997c67..663959874ede8e9a70d15606f2f8f11e
          if success:
              if recv_req.flush_cache:
 diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
-index 81424329a0c1b1470d63452ce65a120a9b639399..91967b1ab0da2b5e57467a480f0b906e7c75657a 100644
+index 81424329a0c1b1470d63452ce65a120a9b639399..4c36e22939ded25da1f4a8c9a4305807af273b19 100644
 --- a/python/sglang/srt/managers/tokenizer_manager.py
 +++ b/python/sglang/srt/managers/tokenizer_manager.py
-@@ -1650,6 +1650,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
+@@ -106,6 +106,7 @@ from sglang.srt.utils import (
+     kill_process_tree,
+ )
+ from sglang.srt.utils.aio_rwlock import RWLock
++from sglang.srt.utils.auth import server_args_without_secrets
+ from sglang.srt.utils.hf_transformers_utils import (
+     get_processor,
+     get_tokenizer,
+@@ -1650,6 +1651,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
              # This is the single write point for first_token_time.
              if state.time_stats.first_token_time == 0.0:
                  state.time_stats.set_first_token_time()
-+                # decode-latency instrumentation: remember the completion-token count of the first output batch
-+                #   (with spec the first round already yields many tokens; needed for a direct decode-only figure)
-+                state._first_chunk_tokens = meta_info.get("completion_tokens", 0)
++                if self.server_args.speculative_algorithm == "SELFSPEC_DIFFUSION":
++                    # self-spec decode-latency instrumentation: remember the completion-token count of the first output
++                    #   batch (the first round already yields many tokens; needed for a direct decode-only figure)
++                    state._first_chunk_tokens = meta_info.get("completion_tokens", 0)
  
              if state.finished:
                  state.time_stats.trace_ctx.trace_set_root_attrs(
-@@ -1657,6 +1660,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
+@@ -1657,6 +1662,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                  )
                  state.time_stats.set_finished_time()
                  meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
-+                # decode-latency instrumentation: stopwatch from prefill completion (first output batch) to finish
-+                meta_info["decode_latency"] = state.time_stats.get_decode_latency()
-+                meta_info["first_chunk_tokens"] = getattr(state, "_first_chunk_tokens", 0)
++                if self.server_args.speculative_algorithm == "SELFSPEC_DIFFUSION":
++                    # self-spec decode-latency instrumentation (self-spec servers only; other servers return upstream's
++                    #   meta_info): stopwatch from prefill completion (first output batch) to finish
++                    meta_info["decode_latency"] = state.time_stats.get_decode_latency()
++                    meta_info["first_chunk_tokens"] = getattr(state, "_first_chunk_tokens", 0)
  
                  if self.server_args.speculative_algorithm:
                      self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
+@@ -2056,7 +2066,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
+     ):
+         logger.info(log_message)
+         to_dump_with_server_args = {
+-            "server_args": self.server_args,
++            "server_args": server_args_without_secrets(self.server_args),
+             "requests": data_list.copy(),
+         }
+ 
+@@ -2117,7 +2127,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
+ 
+         # Write the data to the file
+         data_to_dump_with_server_args = {
+-            "server_args": self.server_args,  # Include server_args in the dump
++            # Include server_args in the dump (without the secrets)
++            "server_args": server_args_without_secrets(self.server_args),
+             "requests": data_to_dump,
+             "launch_command": " ".join(sys.argv),
+         }
 diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
 index ba777330000f86e3e8655519f47a5d4ff3049a09..ddc09c3c478edf6eff97a695bce353bf22b7ed64 100644
 --- a/python/sglang/srt/managers/utils.py
@@ -682,33 +897,8 @@ index ba777330000f86e3e8655519f47a5d4ff3049a09..ddc09c3c478edf6eff97a695bce353bf
      def copy_to_cpu(self, return_logprob: bool):
          """Copy tensors to CPU in overlap scheduling.
          Only the tensors which are needed for processing results are copied,
-diff --git a/python/sglang/srt/mem_cache/radix_cache.py b/python/sglang/srt/mem_cache/radix_cache.py
-index 7d1616037243197972caedfa74b3c5805762d1cf..ca9bfb54f9b3b8252a21d41dfa4c3f61d8fc79d8 100644
---- a/python/sglang/srt/mem_cache/radix_cache.py
-+++ b/python/sglang/srt/mem_cache/radix_cache.py
-@@ -513,6 +513,20 @@ class RadixCache(BasePrefixCache):
-             return
- 
-         token_ids = req.fill_ids
-+        # dllm SLIDE: fill_ids = origin + output + [mask]*block_size. With a variable (< block_size)
-+        # commit, trailing MASK tokens remain in fill_ids. Caching them would let the next round's
-+        # radix match consume those mask positions (mask_id repeats) and shrink the block (crash:
-+        # "input_ids size 8"). So cache only the COMMITTED tokens (origin+output); the block masks
-+        # are transient (re-forwarded each round). (No-op for lockstep dllm: masks are fully
-+        # overwritten by the block_size commit, so committed == fill_ids.)
-+        if getattr(req, "dllm_config", None) is not None:
-+            # Cache only the COMMITTED tokens (origin+output); the trailing [mask]*block_size in
-+            # fill_ids is transient. Caching the masks would let the next round's prefix match
-+            # consume the mask_id repeats and shrink the block (crash "input_ids size 8"). No-op for
-+            # lockstep dllm (masks fully overwritten -> committed == fill_ids). The transient block
-+            # KV slots are freed per-round in scheduler.process_batch_result_dllm, not here.
-+            committed = len(req.origin_input_ids) + len(req.output_ids)
-+            token_ids = token_ids[:committed]
-         kv_indices = self.req_to_token_pool.req_to_token[
-             req.req_pool_idx, : len(token_ids)
-         ]
 diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
-index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b64cdca892 100644
+index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c550a21b4 100644
 --- a/python/sglang/srt/model_executor/cuda_graph_runner.py
 +++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
 @@ -264,6 +264,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
@@ -741,23 +931,55 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
  
          if require_gathered_buffer:
              self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
-@@ -543,6 +555,49 @@ class CudaGraphRunner:
+@@ -501,6 +513,30 @@ def set_global_graph_memory_pool(val):
+     global_graph_memory_pool = val
+ 
+ 
++def _selfspec_capture_variants(runner, base_key):
++    """(graph key, extra capture_one_batch_size kwargs) of each graph CudaGraphRunner.capture() records per batch size.
++
++    Upstream (and every runner that is not a self-spec runner): one graph keyed base_key, captured with
++    capture_one_batch_size(bs, forward, stream_idx) and no extra argument. A self-spec runner (SELFSPEC_DIFFUSION)
++    captures one graph per intra-block causal flag with SELFSPEC_NOMASK=1 (key (base_key, causal), kwarg dllm_causal)
++    and one per role with SELFSPEC_FASTATTN=1 (key (base_key, role), kwarg ss_role); __init__ refuses both together.
++    The flags are read with getattr: the EAGLE / EAGLE3 / NEXTN / STANDALONE draft runners call
++    CudaGraphRunner.capture(self) without running CudaGraphRunner.__init__, and their capture_one_batch_size
++    accepts neither kwarg."""
++    causal_flags = (False, True) if getattr(runner, "is_dual_causal_graph", False) else (None,)
++    roles = ("draft", "verify") if getattr(runner, "ss_fast", False) else (None,)
++    variants = []
++    for causal in causal_flags:
++        for role in roles:
++            key, kwargs = base_key, {}
++            if causal is not None:
++                key, kwargs["dllm_causal"] = (key, causal), causal
++            if role is not None:
++                key, kwargs["ss_role"] = (key, role), role
++            variants.append((key, kwargs))
++    return variants
++
++
+ class CudaGraphRunner:
+     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
+ 
+@@ -543,6 +579,51 @@ class CudaGraphRunner:
  
          self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
          self.is_dllm = self.dllm_config is not None
-+        # SELFSPEC, like dllm, alternates a bidirectional block draft and a causal verify, so it needs two graphs:
-+        # causal reaches wrapper.forward(causal=...) as a Python scalar and is baked into the graph at capture,
-+        # so one graph cannot serve both modes. Self-spec serving does not pass --dllm-algorithm, so dllm_config
-+        # is None and the dllm dual-graph path alone would not apply (modes would be distinguished by masks -> CUSTOM).
++        # Everything below up to capture_forward_mode is for self-spec servers (SELFSPEC_DIFFUSION) only; on every
++        # other server (dLLMs included) these flags are False and the runner behaves as upstream.
 +        self.is_selfspec = bool(
 +            getattr(model_runner, "spec_algorithm", None) is not None
 +            and model_runner.spec_algorithm.is_selfspec_diffusion()
 +        )
++        # SELFSPEC_NOMASK=1 (experimental, default off) alternates a bidirectional block draft and a causal verify
++        # without masks: causal reaches wrapper.forward(causal=...) as a Python scalar and is baked into the graph
++        # at capture, so it needs two graphs per bs, keyed (bs, causal).
 +        # NOTE: dual graphs only on the mask-free path. Capturing twice at the same bs overwrites
 +        # flashinfer's prefill_cuda_graph_metadata[bs] with the second wrapper set: the first graph
 +        # replays kernels bound to buffer set A while plan() updates set B ->
 +        # mismatched metadata and corrupted output (observed on the mask path).
-+        self.is_dual_causal_graph = self.is_dllm or (
++        self.is_dual_causal_graph = bool(
 +            self.is_selfspec and os.environ.get("SELFSPEC_NOMASK", "0") == "1"
 +        )
 +        # SELFSPEC_FASTATTN=1: mask-free draft/verify attention -> one graph per (bs, role), each role with its
@@ -770,7 +992,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
 +        if self.is_selfspec and not self.ss_fast and os.environ.get("SELFSPEC_FASTATTN", "0") == "1":
 +            raise ValueError("SELFSPEC_FASTATTN=1 but the attention backend has no fast-path planner")
 +        if self.ss_fast and self.is_dual_causal_graph:
-+            raise ValueError("SELFSPEC_FASTATTN=1 cannot be combined with SELFSPEC_NOMASK=1 / dllm dual-causal graphs")
++            raise ValueError("SELFSPEC_FASTATTN=1 cannot be combined with SELFSPEC_NOMASK=1 (dual-causal graphs)")
 +        # SELFSPEC_PADFIX (old custom-mask path only): pad the mask for the dummy rows of a padded replay (out-of-bounds mask read).
 +        # Default 1: a bug fix touching only dummy rows; SELFSPEC_PADFIX=0 restores the unpadded behavior exactly.
 +        # The fast path has no mask, so it is moot there.
@@ -780,10 +1002,11 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
 +        if self.ss_fast and getattr(model_runner.server_args, "enable_dp_attention", False):
 +            raise ValueError("SELFSPEC_FASTATTN=1 does not support --enable-dp-attention (IDLE forwards carry no draft/verify role)")
 +        # SELFSPEC_MROPE_FIX=1 (self-spec servers only; default 0 = unchanged): M-RoPE rows copied as contiguous
-+        # pairs in replay (populate_from_forward_batch(mrope_rows=...)), DLLM_PROF / DLLM_GRAPH_DBG read once here instead of per replay.
++        # pairs in replay (populate_from_forward_batch(mrope_rows=...)).
 +        self.ss_mrope_fix = bool(self.is_selfspec and os.environ.get("SELFSPEC_MROPE_FIX", "0") == "1")
-+        self._env_dllm_prof = os.environ.get("DLLM_PROF", "0") == "1"
-+        self._env_graph_dbg = os.environ.get("DLLM_GRAPH_DBG", "0") == "1"
++        # DLLM_PROF / DLLM_GRAPH_DBG (self-spec diagnostics, default off): replay instrumentation, read once here.
++        self._env_dllm_prof = bool(self.is_selfspec and os.environ.get("DLLM_PROF", "0") == "1")
++        self._env_graph_dbg = bool(self.is_selfspec and os.environ.get("DLLM_GRAPH_DBG", "0") == "1")
 +        if self.is_selfspec:
 +            logger.info(f"[selfspec] cuda graph runner: fastattn={int(self.ss_fast)} padfix={int(self.ss_padfix)} "
 +                        f"mrope_fix={int(self.ss_mrope_fix)} "
@@ -791,7 +1014,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
  
          self.capture_forward_mode = ForwardMode.DECODE
          self.capture_hidden_mode = CaptureHiddenMode.NULL
-@@ -551,6 +606,7 @@ class CudaGraphRunner:
+@@ -551,6 +632,7 @@ class CudaGraphRunner:
              model_runner.spec_algorithm.is_eagle()
              or model_runner.spec_algorithm.is_standalone()
              or model_runner.spec_algorithm.is_ngram()
@@ -799,7 +1022,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
          ):
              if self.model_runner.is_draft_worker:
                  raise RuntimeError("This should not happen")
-@@ -679,6 +735,13 @@ class CudaGraphRunner:
+@@ -679,6 +761,13 @@ class CudaGraphRunner:
          graph_key = cuda_graph_bs
          if self.enable_pdmux:
              graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
@@ -813,7 +1036,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
  
          is_bs_supported = (
              graph_key in self.graphs
-@@ -720,16 +783,97 @@ class CudaGraphRunner:
+@@ -720,16 +809,70 @@ class CudaGraphRunner:
                  forward_batch.batch_size * self.num_tokens_per_bs
                  == forward_batch.input_ids.numel()
              )
@@ -825,21 +1048,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
              else True
          )
  
-+        # Multimodal embedding injection (vision encoder + scatter into input_embeds) is NOT part of
-+        # the captured decode graph. dllm makes the PREFILL a DLLM_EXTEND forward (graph-eligible by
-+        # mode, unlike a normal EXTEND prefill), so an image-containing prefill would replay the
-+        # image-less graph and the image pad_value token ids in input_ids hit the text embedding
-+        # gather -> "vectorized gather kernel index out of bounds". Run any mm-injecting forward eager.
-+        # This mirrors general_mm_embed_routine's injection condition exactly (mm_utils.py): it injects
-+        # iff (not is_decode and not is_target_verify and contains_mm_inputs). A pure-text decode block
-+        # (no mm_inputs) is unaffected and still graphs.
-+        is_mm_supported = not (
-+            forward_batch.contains_mm_inputs()
-+            and not forward_batch.forward_mode.is_decode()
-+            and not forward_batch.forward_mode.is_target_verify()
-+        )
-+
-+        # selfspec custom_mask overrun guard.
++        # selfspec custom_mask overrun guard (self-spec servers only; other spec algorithms keep upstream's can_run).
 +        # custom_mask has sum_req K*(seq_len_req + K) elements and grows with the context, while the cuda
 +        # graph replays flashinfer's fixed packed buffer cuda_graph_custom_mask (max_num_tokens*max_context_len
 +        # uint8). Overflowing it kills the scheduler with an illegal memory access at replay.
@@ -848,7 +1057,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
 +        # this return value is the only place where False actually forces eager.
 +        is_selfspec_mask_supported = True
 +        _spec = getattr(forward_batch, "spec_info", None)
-+        _mask = getattr(_spec, "custom_mask", None)
++        _mask = getattr(_spec, "custom_mask", None) if self.is_selfspec else None
 +        if _mask is not None:
 +            _cap = getattr(self.model_runner.attn_backend, "cuda_graph_custom_mask", None)
 +            if _cap is not None:
@@ -875,18 +1084,6 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
 +                            "or enlarge the buffer for the context length.",
 +                            _packed_upper, _cap.numel())
 +
-+        if (self.is_dllm and os.environ.get("DLLM_PROF", "0") == "1"
-+                and getattr(forward_batch, "dllm_ragged_causal", None) is False
-+                and not forward_batch.contains_mm_inputs()
-+                and getattr(self, "_cr_dbg", 0) < 3):
-+            if not (is_bs_supported and is_encoder_lens_supported and is_tbo_supported
-+                    and capture_hidden_mode_matches and is_ngram_supported and is_mm_supported):
-+                self._cr_dbg = getattr(self, "_cr_dbg", 0) + 1
-+                print(f"[canrun] causal={getattr(forward_batch,'dllm_ragged_causal',None)} "
-+                      f"bs_sup={is_bs_supported} enc={is_encoder_lens_supported} tbo={is_tbo_supported} "
-+                      f"hidden={capture_hidden_mode_matches} ngram={is_ngram_supported} mm={is_mm_supported} "
-+                      f"cuda_graph_bs={cuda_graph_bs} max_bs={self.max_bs} disable_pad={self.disable_padding} "
-+                      f"req_hidden={forward_batch.capture_hidden_mode} cap_hidden={self.capture_hidden_mode}", flush=True)
 +        # SELFSPEC_FASTATTN: graphs are keyed (bs, role); a TARGET_VERIFY forward without a role has no graph -> eager. The
 +        # host-planned attention needs seq_lens_cpu (replay_prepare would otherwise hand it stale buffer values) -> eager raises.
 +        # A draft window longer than K (SELFSPEC_TRAIN_MASKS=1) already fails is_ngram_supported above -> eager.
@@ -906,13 +1103,12 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
              and is_tbo_supported
              and capture_hidden_mode_matches
              and is_ngram_supported
-+            and is_mm_supported
 +            and is_selfspec_mask_supported
 +            and is_ss_role_supported
          )
  
      def _init_profile_context_and_memory_record(self):
-@@ -790,14 +934,25 @@ class CudaGraphRunner:
+@@ -790,14 +933,17 @@ class CudaGraphRunner:
                      num_tokens=bs * self.num_tokens_per_bs,
                      tp_group=self.model_runner.tp_group,
                  ) as forward:
@@ -920,33 +1116,24 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
 -                        graph,
 -                        output_buffers,
 -                    ) = self.capture_one_batch_size(bs, forward, stream_idx)
--                    # For pd_multiplexing, we need to save the graph and output buffers
+                     # For pd_multiplexing, we need to save the graph and output buffers
 -                    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
 -                    self.graphs[key] = graph
 -                    self.output_buffers[key] = output_buffers
-+                    # dllm self-spec: capture two graphs per bs (bidir draft + causal verify),
-+                    # keyed (base_key, causal). Other paths: one graph keyed by base_key.
-+                    dllm_variants = (False, True) if getattr(self, "is_dual_causal_graph", False) else (None,)
-+                    # SELFSPEC_FASTATTN: two graphs per bs, keyed (bs, "draft") / (bs, "verify")
-+                    ss_roles = ("draft", "verify") if self.ss_fast else (None,)
-+                    for dcausal, ss_role in [(d, r) for d in dllm_variants for r in ss_roles]:
++                    base_key = bs if stream_idx is None else f"{stream_idx}_{bs}"
++                    # One graph per bs, captured with capture_one_batch_size(bs, forward, stream_idx) exactly as
++                    # upstream, unless this is a self-spec runner with graph variants (_selfspec_capture_variants).
++                    for key, variant_kwargs in _selfspec_capture_variants(self, base_key):
 +                        (
 +                            graph,
 +                            output_buffers,
-+                        ) = self.capture_one_batch_size(
-+                            bs, forward, stream_idx, dllm_causal=dcausal, ss_role=ss_role
-+                        )
-+                        # For pd_multiplexing, we need to save the graph and output buffers
-+                        base_key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-+                        key = base_key if dcausal is None else (base_key, dcausal)
-+                        if ss_role is not None:
-+                            key = (key, ss_role)
++                        ) = self.capture_one_batch_size(bs, forward, stream_idx, **variant_kwargs)
 +                        self.graphs[key] = graph
 +                        self.output_buffers[key] = output_buffers
  
          # Trigger CUDA graph capture for specific shapes.
          # Capture the large shapes first so that the smaller shapes
-@@ -837,7 +992,12 @@ class CudaGraphRunner:
+@@ -837,7 +983,12 @@ class CudaGraphRunner:
          return torch.cuda.CUDAGraph()
  
      def capture_one_batch_size(
@@ -960,7 +1147,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
      ):
          buffers: DecodeInputBuffers = self.buffers
          graph = self._create_device_graph()
-@@ -901,6 +1061,8 @@ class CudaGraphRunner:
+@@ -901,6 +1052,8 @@ class CudaGraphRunner:
              global_dp_buffer_len = None
  
          spec_info = self.get_spec_info(num_tokens)
@@ -969,12 +1156,12 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
          if self.capture_hidden_mode != CaptureHiddenMode.FULL:
              self.capture_hidden_mode = (
                  spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
-@@ -964,6 +1126,14 @@ class CudaGraphRunner:
+@@ -964,6 +1117,14 @@ class CudaGraphRunner:
              lora_ids=lora_ids,
          )
  
-+        # dllm SELF-SPEC: the block-internal (ragged) attention causal is a python bool passed to
-+        # wrapper.forward(causal=...) -> BAKED into the captured kernel. DRAFT needs bidir
++        # SELFSPEC_NOMASK=1 (self-spec only; None everywhere else): the block-internal attention causal is a python
++        # bool passed to wrapper.forward(causal=...) -> BAKED into the captured kernel. DRAFT needs bidir
 +        # (causal=False), VERIFY needs causal (causal=True), so we capture TWO graphs per bs and
 +        # pick at replay by forward_batch.dllm_ragged_causal. The flashinfer wrapper's planned
 +        # metadata is causal-agnostic, so both graphs share it (only the baked forward() differs).
@@ -984,7 +1171,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
          # HiSparse: set coordinator so the hisparse code path is captured into the graph
          forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
          if forward_batch.hisparse_coordinator is not None:
-@@ -1103,6 +1273,7 @@ class CudaGraphRunner:
+@@ -1103,6 +1264,7 @@ class CudaGraphRunner:
                  self.model_runner.server_args
              ),
              pp_proxy_tensors=pp_proxy_tensors,
@@ -992,7 +1179,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
          )
          if self.enable_two_batch_overlap:
              self.tbo_plugin.replay_prepare(
-@@ -1111,8 +1282,24 @@ class CudaGraphRunner:
+@@ -1111,8 +1273,24 @@ class CudaGraphRunner:
                  num_token_non_padded=len(forward_batch.input_ids),
                  spec_info=forward_batch.spec_info,
              )
@@ -1018,23 +1205,23 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
          # Attention backend
          if self.enable_pdmux:
              stream_idx = get_current_stream_idx()
-@@ -1146,6 +1333,10 @@ class CudaGraphRunner:
+@@ -1146,6 +1324,10 @@ class CudaGraphRunner:
      ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
          self.deepep_adapter.replay()
  
-+        _gp = self._env_dllm_prof if self.ss_mrope_fix else os.environ.get("DLLM_PROF", "0") == "1"
++        _gp = self._env_dllm_prof
 +        if _gp:
 +            import time as _gt
 +            torch.cuda.synchronize(); _gpa = _gt.perf_counter()
          if not skip_attn_backend_init:
              self.replay_prepare(forward_batch, pp_proxy_tensors)
          else:
-@@ -1158,7 +1349,38 @@ class CudaGraphRunner:
+@@ -1158,7 +1340,38 @@ class CudaGraphRunner:
              graph_key = f"{get_current_stream_idx()}_{self.bs}"
          else:
              graph_key = self.bs
-+        # dllm self-spec: two graphs per bs (bidir draft / causal verify) — pick by the current
-+        # forward's ragged-causal flag (set by the algorithm: False=draft, True=verify).
++        # SELFSPEC_NOMASK=1: two graphs per bs (bidir draft / causal verify) — pick by the current
++        # forward's causal flag (set by the self-spec worker: False=draft, True=verify).
 +        if self.is_dual_causal_graph:
 +            graph_key = (graph_key, bool(getattr(forward_batch, "dllm_ragged_causal", False)))
 +        if self.ss_fast:
@@ -1042,7 +1229,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
 +            if _role is None:
 +                raise RuntimeError("[selfspec-fastattn] graph replay of a forward without a draft/verify role (can_run sends those eager)")
 +            graph_key = (graph_key, _role)
-+        if (self._env_graph_dbg if self.ss_mrope_fix else os.environ.get("DLLM_GRAPH_DBG", "0") == "1"):
++        if self._env_graph_dbg:
 +            b = self.buffers
 +            mp = b.mrope_positions
 +            print(f"[graphdbg] in_ids={b.input_ids[:self.raw_num_token].tolist()} "
@@ -1068,7 +1255,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
          output = self.output_buffers[graph_key]
  
          if isinstance(output, LogitsProcessorOutput):
-@@ -1210,12 +1432,29 @@ class CudaGraphRunner:
+@@ -1210,12 +1423,29 @@ class CudaGraphRunner:
                      seq_lens_cpu=None,
                  )
  
@@ -1101,22 +1288,21 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..5a6e64c54ba8ee44dda55934401a91b6
                  retrive_index=None,
                  retrive_next_token=None,
 diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
-index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..2a6e3f1fafb557e3ba8840ddc9fa2ef64ecf9086 100644
+index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..1d3749343f3541188ad04300c04cc777cf5e8767 100644
 --- a/python/sglang/srt/model_executor/forward_batch_info.py
 +++ b/python/sglang/srt/model_executor/forward_batch_info.py
-@@ -77,6 +77,82 @@ if TYPE_CHECKING:
+@@ -77,6 +77,81 @@ if TYPE_CHECKING:
  
  _is_npu = is_npu()
  
-+# SELFSPEC_MROPE_FIX=1 (default 0 = the code below, unchanged): the self-spec (draft / verify)
-+# M-RoPE positions without a host sync. The old branch caches the device copy of each request's mrope_position_delta on
-+# mm_input._mrope_delta_dev but compares d.device (cuda:0) with torch.device(model_runner.device) (the string "cuda" -> device
-+# index None): never equal, so the cache misses on EVERY forward and the pageable `.to(device)` (a blocking copy) waits for the
-+# queued GPU work -- in the verify forward that is the whole draft graph. With the flag:
++# SELFSPEC_MROPE_FIX=1 (self-spec servers only; default 0 = upstream's branch in _compute_spec_mrope_positions): the self-spec
++# (draft / verify) M-RoPE positions without a host sync. The stock branch stacks each request's CPU mrope_position_delta and
++# uploads it on EVERY forward with a pageable `.to(device)` (a blocking copy) that waits for the queued GPU work -- in the
++# verify forward that is the whole draft graph. With the flag:
 +#   * the [bs, 1] device delta is cached per batch composition (key = the requests' CPU delta tensor objects, by identity; the
 +#     cache holds them, so an id cannot be reused) and uploaded with one non_blocking copy only when the composition changes;
 +#   * the [3, bs*n] positions are ONE broadcast-add kernel into a contiguous output (was stack + add + flatten + repeat).
-+# The values are the same int64 as the old branch; SELFSPEC_CHECK=1 recomputes the old branch every forward and raises on any
++# The values are the same int64 as the stock branch; SELFSPEC_CHECK=1 recomputes it every forward and raises on any
 +# difference (it syncs: diagnostic only).
 +import os as _os
 +
@@ -1130,7 +1316,7 @@ index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..2a6e3f1fafb557e3ba8840ddc9fa2ef6
 +    CPU mrope_position_delta tensor object (None for a request without mm inputs), compared by identity; the cache keeps those
 +    objects alive, so a key cannot alias a new request. mrope_position_delta is fixed at prefill (scheduler.py
 +    _maybe_compute_mrope_positions / MultimodalInputs.merge assign a new tensor, nothing mutates it in place). A miss builds the
-+    same stack as the old branch on the host and uploads it once through pinned memory, non_blocking (no stream sync)."""
++    same stack as the stock branch on the host and uploads it once through pinned memory, non_blocking (no stream sync)."""
 +    c = _ss_mrope_cache
 +    key = tuple(None if mi is None else mi.mrope_position_delta for mi in mm_inputs)
 +    prev = c["key"]
@@ -1138,7 +1324,7 @@ index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..2a6e3f1fafb557e3ba8840ddc9fa2ef6
 +        return c["val"]
 +    if all(mi is None for mi in mm_inputs):
 +        cpu = torch.zeros((batch_size, 1), dtype=torch.int64)
-+    else:   # exactly the old branch's per-request values (it raises the same way on a request whose delta is None)
++    else:   # exactly the stock branch's per-request values (it raises the same way on a request whose delta is None)
 +        cpu = torch.stack(
 +            [torch.zeros(1, dtype=torch.int64) if mi is None else mi.mrope_position_delta.squeeze(0) for mi in mm_inputs], dim=0
 +        )
@@ -1149,7 +1335,7 @@ index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..2a6e3f1fafb557e3ba8840ddc9fa2ef6
 +
 +
 +def _ss_spec_mrope_positions(seq_positions: torch.Tensor, mm_inputs, batch_size: int, device) -> torch.Tensor:
-+    """SELFSPEC_MROPE_FIX: [3, bs*n] M-RoPE positions = seq_positions + per-request delta on all three rows (the old branch's
++    """SELFSPEC_MROPE_FIX: [3, bs*n] M-RoPE positions = seq_positions + per-request delta on all three rows (the stock branch's
 +    (seq + delta).flatten().unsqueeze(0).repeat(3, 1)), as one broadcast add into a contiguous output."""
 +    delta = _ss_spec_mrope_delta(mm_inputs, batch_size, device)
 +    if delta.dim() != 2 or delta.shape[0] != batch_size or delta.shape[1] != 1:   # not the [bs, 1] layout: old formula, cached delta
@@ -1161,7 +1347,7 @@ index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..2a6e3f1fafb557e3ba8840ddc9fa2ef6
 +
 +
 +def _ss_spec_mrope_check(new: torch.Tensor, seq_positions: torch.Tensor, mm_inputs, batch_size: int, device) -> None:
-+    """SELFSPEC_MROPE_FIX + SELFSPEC_CHECK: recompute the old branch (fresh blocking upload, as its cache always missed) and
++    """SELFSPEC_MROPE_FIX + SELFSPEC_CHECK: recompute the stock branch (fresh blocking upload, as that branch does) and
 +    require identical shape, dtype and values. Syncs; diagnostic only."""
 +    if all(mi is None for mi in mm_inputs):
 +        delta = torch.zeros((batch_size, 1), dtype=torch.int64, device=device)
@@ -1187,50 +1373,26 @@ index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..2a6e3f1fafb557e3ba8840ddc9fa2ef6
  
  class ForwardMode(IntEnum):
      # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
-@@ -524,14 +600,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
- 
-         # Override the positions with diffusion LLM or spec_info
-         if batch.dllm_config is not None:
-+            # Per-req extend length: == block_size for a decode block, but a PREFILL chunk can be
-+            # larger (we un-chunk the prompt prefill from block_size to chunked_prefill). Using the
-+            # actual extend_seq_lens makes positions [block_offset .. block_offset+ext_len) correct
-+            # for both; hardcoding block_size gave too few positions for a >block_size prefill chunk
-+            # -> illegal memory access in rotary/KV.
-             block_size = batch.dllm_config.block_size
-+            ext_lens = batch.extend_seq_lens
-+            if not isinstance(ext_lens, list) or len(ext_lens) != len(batch.dllm_block_offsets):
-+                ext_lens = [block_size] * len(batch.dllm_block_offsets)
-             # Use int64 for AMD rotary embedding kernel compatibility
-             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
-             ret.positions = torch.tensor(
-                 [
-                     i
--                    for block_offset in batch.dllm_block_offsets
--                    for i in range(block_offset, block_offset + block_size)
-+                    for block_offset, ext_len in zip(batch.dllm_block_offsets, ext_lens)
-+                    for i in range(block_offset, block_offset + ext_len)
-                 ],
-                 dtype=positions_dtype,
-             ).to(device, non_blocking=True)
-@@ -541,6 +625,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+@@ -541,6 +616,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
          ):
              ret.positions = ret.spec_info.positions
  
-+        # SELFSPEC mask-free path: the intra-block causal flag travels on spec_info and is read here
++        # SELFSPEC_NOMASK=1 (self-spec servers only): the intra-block causal flag travels on spec_info and is read here
 +        # (draft=False=bidirectional, verify=True=causal). It is both the attention wrapper's causal kwarg
 +        # and part of the cuda-graph key, so it needs a channel from the worker to ForwardBatch.
-+        _ss_causal = getattr(ret.spec_info, "selfspec_causal", None)
-+        if _ss_causal is not None:
-+            ret.dllm_ragged_causal = bool(_ss_causal)
++        if model_runner.spec_algorithm.is_selfspec_diffusion():
++            _ss_causal = getattr(ret.spec_info, "selfspec_causal", None)
++            if _ss_causal is not None:
++                ret.dllm_ragged_causal = bool(_ss_causal)
 +
          # Init position information
          if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
              if ret.positions is None:
-@@ -715,21 +806,38 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+@@ -715,6 +798,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
  
          else:  # target_verify or draft_decode
              seq_positions = batch.spec_info.positions.view(batch_size, -1)
-+            if _SS_MROPE_FIX:
++            if _SS_MROPE_FIX and model_runner.spec_algorithm.is_selfspec_diffusion():
 +                self.mrope_positions = _ss_spec_mrope_positions(seq_positions, mm_inputs, batch_size, device)
 +                if _SS_MROPE_CHECK:
 +                    _ss_spec_mrope_check(self.mrope_positions, seq_positions, mm_inputs, batch_size, device)
@@ -1238,96 +1400,20 @@ index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..2a6e3f1fafb557e3ba8840ddc9fa2ef6
              # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
              if all(mm_input is None for mm_input in mm_inputs):
                  mrope_delta_tensor = torch.zeros(
-                     (batch_size, 1), dtype=torch.int64, device=device
-                 )
-             else:
--                mrope_deltas = [
--                    (
--                        torch.zeros(1, dtype=torch.int64)
--                        if mm_inputs[i] is None
--                        else mm_inputs[i].mrope_position_delta.squeeze(0)
--                    )
--                    for i in range(batch_size)
--                ]
--                mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
-+                # mrope_position_delta is constant for the life of a request (fixed by the image grid at prefill),
-+                # yet the stock code stacks CPU tensors and moves them to the device on every forward ->
-+                # two H2D copies per round (draft/verify). Here a device copy is cached on mm_input and the
-+                # stack happens on the device (identical result; see SELFSPEC_MROPE_FIX above for the cache key).
-+                mrope_deltas = []
-+                for i in range(batch_size):
-+                    mi = mm_inputs[i]
-+                    if mi is None:
-+                        mrope_deltas.append(
-+                            torch.zeros(1, dtype=torch.int64, device=device)
-+                        )
-+                        continue
-+                    d = getattr(mi, "_mrope_delta_dev", None)
-+                    if d is None or d.device != torch.device(device):
-+                        d = mi.mrope_position_delta.squeeze(0).to(device=device)
-+                        try:
-+                            mi._mrope_delta_dev = d
-+                        except Exception:  # if assignment is blocked (slots etc.), proceed without the cache
-+                            pass
-+                    mrope_deltas.append(d)
-+                mrope_delta_tensor = torch.stack(mrope_deltas, dim=0)
-             next_input_positions = (
-                 (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
-             )
-@@ -773,6 +881,37 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
-                         mm_input, self.seq_lens_cpu[batch_idx]
-                     )
-                     mrope_positions_list[batch_idx] = mrope_positions
-+            elif self.forward_mode.is_dllm_extend():
-+                # dllm forward (block_size tokens at 1D positions [off .. off+block_size-1]) covers
-+                # BOTH prefill chunks (which contain image tokens needing the precomputed 2D-grid
-+                # M-RoPE) AND decode blocks (pure text after the prompt). So:
-+                #  - 1D position p < prompt_len  -> slice precomputed mm_input.mrope_positions[:,p]
-+                #    (image-aware; same as is_extend).
-+                #  - p >= prompt_len (decode)    -> continue +1 per token from the last prompt mrope
-+                #    (text continuation; all 3 dims equal).
-+                # A single text base (max(image_mrope)+1+off) would apply text positions to image chunks AND
-+                # double-count the image span -> garbled / mid-response reads.
-+                off = int(batch.extend_prefix_lens[batch_idx])
-+                # actual extend length (block_size for a decode block; larger for an un-chunked
-+                # prefill chunk). Hardcoding block_size gave too few mrope positions for a
-+                # >block_size prefill chunk -> illegal memory access.
-+                ext_len = int(batch.extend_seq_lens[batch_idx])
-+                positions_1d = torch.arange(off, off + ext_len, dtype=torch.int64)
-+                if (
-+                    mm_input is None
-+                    or get_global_server_args().rl_on_policy_target is not None
-+                    or getattr(mm_input, "mrope_positions", None) is None
-+                    or mm_input.mrope_positions.numel() == 0
-+                ):
-+                    mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
-+                else:
-+                    pm = mm_input.mrope_positions  # [3, prompt_len], image-aware
-+                    P = pm.shape[1]
-+                    clamped = positions_1d.clamp(max=P - 1).to(pm.device)
-+                    base_mrope = pm[:, clamped]  # [3, block_size]
-+                    overflow = (positions_1d - (P - 1)).clamp(min=0).to(pm.device)  # 0 in-prompt
-+                    mrope_positions = (base_mrope + overflow).cpu()
-+                mrope_positions_list[batch_idx] = mrope_positions
-             elif self.forward_mode.is_extend(include_draft_extend_v2=True):
-                 extend_seq_len, extend_prefix_len = (
-                     batch.extend_seq_lens[batch_idx],
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index a59742b9435445d71c2d583a51e56ec782f3e95a..05cfeac18def49e8effa9fb4c802427751effae8 100644
+index a59742b9435445d71c2d583a51e56ec782f3e95a..72f6630d18875724f45f83f43932425668b064ee 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -344,6 +344,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -344,6 +344,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
          self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
          self.attention_chunk_size = model_config.attention_chunk_size
          self.forward_pass_id = 0
-+        # SELFSPEC_MROPE_FIX=1 on a self-spec server: DLLM_PROF read once here instead of twice per forward
-+        # (forward / _forward_raw). Other servers (AR included) keep the per-forward read, unchanged.
-+        self._ss_env_once = bool(self.spec_algorithm.is_selfspec_diffusion() and os.environ.get("SELFSPEC_MROPE_FIX", "0") == "1")
-+        self._env_dllm_prof = os.environ.get("DLLM_PROF", "0") == "1"
++        # DLLM_PROF=1 (self-spec diagnostics, default off): forward timing prints, self-spec servers only, read once here.
++        self._env_dllm_prof = bool(self.spec_algorithm.is_selfspec_diffusion() and os.environ.get("DLLM_PROF", "0") == "1")
          self.init_new_workspace = False
          self.draft_model_idx = draft_model_idx
          self.enable_hisparse = server_args.enable_hisparse
-@@ -2087,6 +2091,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2087,6 +2089,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              self.spec_algorithm.is_eagle()
              or self.spec_algorithm.is_standalone()
              or self.spec_algorithm.is_ngram()
@@ -1335,7 +1421,7 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..05cfeac18def49e8effa9fb4c8024277
          ):
              return not self.is_draft_worker
  
-@@ -2121,6 +2126,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2121,6 +2124,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              self.spec_algorithm.is_eagle()
              or self.spec_algorithm.is_standalone()
              or self.spec_algorithm.is_ngram()
@@ -1343,7 +1429,7 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..05cfeac18def49e8effa9fb4c8024277
          ):
              if self.is_draft_worker:
                  raise RuntimeError("This should not happen")
-@@ -2270,7 +2276,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2270,7 +2274,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                          seq_lens_cpu=None,
                      )
  
@@ -1355,12 +1441,11 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..05cfeac18def49e8effa9fb4c8024277
                  from sglang.srt.speculative.ngram_info import NgramVerifyInput
  
                  spec_info = NgramVerifyInput(
-@@ -2732,10 +2741,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2732,10 +2739,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
      ) -> ModelRunnerOutput:
          self.forward_pass_id += 1
  
-+        import os as _os3
-+        _wp = self._env_dllm_prof if self._ss_env_once else _os3.environ.get("DLLM_PROF", "0") == "1"
++        _wp = self._env_dllm_prof
 +        if _wp:
 +            import time as _wt, torch as _wtor
 +            _wtor.cuda.synchronize(); _wa = _wt.perf_counter()
@@ -1374,7 +1459,7 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..05cfeac18def49e8effa9fb4c8024277
              output = self._forward_raw(
                  forward_batch,
                  skip_attn_backend_init,
-@@ -2743,6 +2760,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2743,6 +2757,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                  reinit_attn_backend,
                  split_forward_count,
              )
@@ -1389,7 +1474,7 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..05cfeac18def49e8effa9fb4c8024277
              elastic_ep_state = ElasticEPStateManager.instance()
              if (
                  elastic_ep_state is not None
-@@ -2779,6 +2804,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2779,6 +2801,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
          if dumper.may_enable:
              dumper.step()
  
@@ -1402,12 +1487,11 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..05cfeac18def49e8effa9fb4c8024277
          return output
  
      def _forward_raw(
-@@ -2794,11 +2825,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2794,11 +2822,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              if self.device == "cpu"
              else forward_batch.forward_mode.is_cuda_graph
          )
-+        import os as _os2
-+        _fp = self._env_dllm_prof if self._ss_env_once else _os2.environ.get("DLLM_PROF", "0") == "1"
++        _fp = self._env_dllm_prof
 +        if _fp:
 +            import time as _ft, torch as _ftor
 +            _ftor.cuda.synchronize(); _fa = _ft.perf_counter()
@@ -1416,12 +1500,6 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..05cfeac18def49e8effa9fb4c8024277
              and self.graph_runner
              and self.graph_runner.can_run(forward_batch)
          )
-+        if (_fp and getattr(forward_batch, "dllm_ragged_causal", None) is False
-+                and not forward_batch.contains_mm_inputs() and getattr(self, "_crg_dbg", 0) < 3):
-+            self._crg_dbg = getattr(self, "_crg_dbg", 0) + 1
-+            print(f"[crg] causal=False mode_check={mode_check()} gr={self.graph_runner is not None} "
-+                  f"can_run={self.graph_runner.can_run(forward_batch) if self.graph_runner else None} "
-+                  f"-> can_run_graph={can_run_graph}", flush=True)
 +        if _fp:
 +            _ftor.cuda.synchronize(); _fb = _ft.perf_counter()
 +            self._fp_canrun = getattr(self, "_fp_canrun", 0.0) + (_fb - _fa)
@@ -1431,52 +1509,17 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..05cfeac18def49e8effa9fb4c8024277
  
          if can_run_graph:
              ret = self.graph_runner.replay(
-diff --git a/python/sglang/srt/models/glm4v.py b/python/sglang/srt/models/glm4v.py
-index 9bb5a92b2cdc30b5add2420bc3e38eed03cdd95f..76542bd198521af028fe9b0f01c8f8b6bfa26fc4 100644
---- a/python/sglang/srt/models/glm4v.py
-+++ b/python/sglang/srt/models/glm4v.py
-@@ -584,7 +584,10 @@ class Glm4vForConditionalGeneration(nn.Module):
- 
-         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
- 
--        self.logits_processor = LogitsProcessor(config)
-+        self.logits_processor = LogitsProcessor(
-+            config,
-+            return_full_logits=True,  # block-diffusion path: the draft needs logits at every position
-+        )
-         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
- 
-         # For EAGLE3 support
-@@ -666,6 +669,19 @@ class Glm4vForConditionalGeneration(nn.Module):
-         if self.is_mrope_enabled:
-             positions = forward_batch.mrope_positions
- 
-+        import os as _os
-+        if _os.environ.get("DUMP_POS"):
-+            _p = positions
-+            _mr = forward_batch.mrope_positions
-+            print(
-+                f"[DUMP] mode={forward_batch.forward_mode} mrope_enabled={self.is_mrope_enabled} "
-+                f"n_in={input_ids.shape} pos.shape={None if _p is None else tuple(_p.shape)} "
-+                f"pos[...,:8]={None if _p is None else _p[..., :8].tolist()} "
-+                f"mrope.shape={None if _mr is None else tuple(_mr.shape)} "
-+                f"dllm={getattr(forward_batch, 'dllm_config', None) is not None}",
-+                flush=True,
-+            )
-+
-         if not (
-             forward_batch.forward_mode.is_decode()
-             or not forward_batch.contains_image_inputs()
 diff --git a/python/sglang/srt/models/glm_ocr.py b/python/sglang/srt/models/glm_ocr.py
-index bb74461d56ba71a388ded342cf8d6561a50507d8..13575658780ca457fde8b39fdb2b04262a3d48bb 100644
+index bb74461d56ba71a388ded342cf8d6561a50507d8..0183b90241e93a25c5e293af962daf95efd11d2d 100644
 --- a/python/sglang/srt/models/glm_ocr.py
 +++ b/python/sglang/srt/models/glm_ocr.py
-@@ -222,7 +222,16 @@ class GlmOcrVisionModel(Glm4vVisionModel):
+@@ -222,7 +222,19 @@ class GlmOcrVisionModel(Glm4vVisionModel):
              vision_config.hidden_size, eps=vision_config.rms_norm_eps
          )
  
 +    # SS_GLM_VIT_GRAPH_MAXM>0 sets self._ss_vit (multimodal/glm_vit_graph_runner.py) at the end of
-+    # GlmOcrForConditionalGeneration.load_weights; unset (default) = the original eager forward below, unchanged.
++    # GlmOcrForConditionalGeneration.load_weights; unset (SGLang's default) or a failed graph capture = the original
++    # eager forward below, unchanged.
 +    _ss_vit = None
 +
      def forward(self, x: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
@@ -1485,19 +1528,12 @@ index bb74461d56ba71a388ded342cf8d6561a50507d8..13575658780ca457fde8b39fdb2b0426
 +        return self._ss_forward_orig(x, grid_thw)
 +
 +    def _ss_forward_orig(self, x: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
++        # KEEP IN SYNC with GlmVitGraphRunner._body (multimodal/glm_vit_graph_runner.py), which replays this body from
++        # `x = self.patch_embed(x)` on (the prologue here becomes its inputs); see the guards named there.
          # patchify
          x = x.to(device=self.device, dtype=self.dtype)
          x = self.patch_embed(x)
-@@ -305,7 +314,7 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
- 
-         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
- 
--        self.logits_processor = LogitsProcessor(config)
-+        self.logits_processor = LogitsProcessor(config, return_full_logits=True)  # block-diffusion: full-position logits
-         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
- 
-         # For EAGLE3 support
-@@ -434,5 +443,26 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
+@@ -434,5 +446,30 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
                      )
                  weight_loader(param, loaded_weight)
  
@@ -1505,21 +1541,25 @@ index bb74461d56ba71a388ded342cf8d6561a50507d8..13575658780ca457fde8b39fdb2b0426
 +            self._ss_maybe_capture_vit_graphs()
 +
 +    def _ss_maybe_capture_vit_graphs(self):
-+        """Exact-M ViT CUDA graphs, only with SS_GLM_VIT_GRAPH_MAXM>0 (default off)."""
++        """Exact-M ViT CUDA graphs (multimodal/glm_vit_graph_runner.py). Off unless SS_GLM_VIT_GRAPH_MAXM > 0 (the
++        GravityOCR launchers set it under FAST=1). A malformed setting stops the startup with a ValueError naming the
++        variable; a failed capture does not: GlmVitGraphRunner.setup() releases what it captured and returns False,
++        and the ViT keeps its original eager forward."""
 +        from sglang.srt.multimodal.glm_vit_graph_runner import (
 +            GlmVitGraphRunner,
-+            glm_vit_graph_maxm,
++            report_settings,
++            vit_graph_settings,
 +        )
 +
-+        maxm = glm_vit_graph_maxm()
-+        if maxm <= 0 or self.visual._ss_vit is not None:
++        settings = vit_graph_settings()
++        report_settings(settings)
++        if settings.maxm <= 0 or self.visual._ss_vit is not None:
 +            return
 +        if self.use_data_parallel or self.visual.device.type != "cuda":
 +            print(f"[ss-vit-graph] OFF: dp_encoder={self.use_data_parallel} device={self.visual.device}", flush=True)
 +            return
-+        runner = GlmVitGraphRunner(self.visual, maxm)
-+        runner.capture()
-+        if runner.graphs or runner.eager_list_ok:
++        runner = GlmVitGraphRunner(self.visual, settings)
++        if runner.setup():
 +            self.visual._ss_vit = runner
 +
  
@@ -1566,14 +1606,45 @@ index a44f14b6ca28af092fe51333a8460e89a2829b68..8f7146f250b8ec8614da219d775521a2
          # GLM-V specific tokens
          self.IMAGE_TOKEN = "<|image|>"
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index d91ced805f5da9e7a0cb6cbdf4ee3e7fd498a696..7b6d06b5ded0ccb8b53baa1b63d3cb76e37a9f3b 100644
+index d91ced805f5da9e7a0cb6cbdf4ee3e7fd498a696..56f67fdc95de278a42dd8b66cd3672aaab43ce09 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
-@@ -3132,6 +3132,28 @@ class ServerArgs:
+@@ -323,7 +323,10 @@ class ServerArgs:
+     ssl_keyfile: Optional[str] = None
+     ssl_certfile: Optional[str] = None
+     ssl_ca_certs: Optional[str] = None
+-    ssl_keyfile_password: Optional[str] = None
++    # Secrets (here and api_key / admin_api_key below) are declared with repr=False, so that repr()
++    # of the args (the startup "server_args=..." log line, /set_internal_state's log line) never
++    # shows them; sglang.srt.utils.auth.SECRET_SERVER_ARG_FIELDS lists them for redaction.
++    ssl_keyfile_password: Optional[str] = dataclasses.field(default=None, repr=False)
+     enable_ssl_refresh: bool = False
+ 
+     # Quantization and data type
+@@ -426,8 +429,8 @@ class ServerArgs:
+     export_metrics_to_file_dir: Optional[str] = None
+ 
+     # API related
+-    api_key: Optional[str] = None
+-    admin_api_key: Optional[str] = None
++    api_key: Optional[str] = dataclasses.field(default=None, repr=False)
++    admin_api_key: Optional[str] = dataclasses.field(default=None, repr=False)
+     served_model_name: Optional[str] = None
+     weight_version: str = "default"
+     chat_template: Optional[str] = None
+@@ -3132,6 +3135,36 @@ class ServerArgs:
                      "Currently ngram speculative decoding does not support dp attention."
                  )
  
 +        if self.speculative_algorithm == "SELFSPEC_DIFFUSION":
++            # Block-diffusion self-spec runs the model as an autoregressive target with its own draft round; SGLang's
++            # diffusion-LLM scheduling (--dllm-algorithm: LLaDA2 / SDAR block decoding) is a different design that
++            # this algorithm never uses, so the two are not combined.
++            if self.dllm_algorithm is not None:
++                raise ValueError(
++                    "SELFSPEC_DIFFUSION cannot be combined with --dllm-algorithm (diffusion-LLM block decoding); "
++                    "the self-spec mask id comes from block_diffusion.json or SELFSPEC_MASK_ID."
++                )
 +            # Block-diffusion self-spec: draft == target model (no separate draft model loaded).
 +            if self.speculative_draft_model_path is not None:
 +                logger.warning(
@@ -1598,7 +1669,7 @@ index d91ced805f5da9e7a0cb6cbdf4ee3e7fd498a696..7b6d06b5ded0ccb8b53baa1b63d3cb76
      def _handle_load_format(self):
          if (
              self.load_format == "auto" or self.load_format == "gguf"
-@@ -4759,7 +4781,7 @@ class ServerArgs:
+@@ -4759,7 +4792,7 @@ class ServerArgs:
          parser.add_argument(
              "--speculative-algorithm",
              type=str,
@@ -1607,46 +1678,11 @@ index d91ced805f5da9e7a0cb6cbdf4ee3e7fd498a696..7b6d06b5ded0ccb8b53baa1b63d3cb76
              help="Speculative algorithm.",
          )
          parser.add_argument(
-diff --git a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
-index 40e859b2d6d6585c152960b8c98c75c1cd67f24d..c386a99c2085595bcf7e7a99240de413e26e0dd7 100644
---- a/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
-+++ b/python/sglang/srt/speculative/eagle_draft_cuda_graph_runner.py
-@@ -79,6 +79,10 @@ class EAGLEDraftCudaGraphRunner:
-         )
-         self.enable_pdmux = False
-         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
-+        # Official (non-dllm) draft runner: it reuses CudaGraphRunner.capture(self) but never runs
-+        # base __init__, so the dllm self-spec attrs are absent. Base GLM-OCR NEXTN is not dllm.
-+        self.is_dllm = False
-+        self.dllm_config = None
- 
-         # Batch sizes to capture
-         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-@@ -213,8 +217,10 @@ class EAGLEDraftCudaGraphRunner:
-         CudaGraphRunner.capture(self)
- 
-     def capture_one_batch_size(
--        self, num_seqs: int, forward: Callable, stream_idx: int = 0
-+        self, num_seqs: int, forward: Callable, stream_idx: int = 0, dllm_causal=None
-     ):
-+        # dllm_causal is passed by the patched base CudaGraphRunner.capture; the official
-+        # (non-dllm) draft runner has is_dllm=False so it is always None here — accept & ignore.
-         buffers = self.buffers
-         graph = self._create_graph()
-         stream = self.stream
 diff --git a/python/sglang/srt/speculative/ngram_info.py b/python/sglang/srt/speculative/ngram_info.py
-index 7aafe98707694f96c5241123d6bfd7452fda4391..64088128cb648a2a3b45ef1e4d71148f056941c5 100644
+index 7aafe98707694f96c5241123d6bfd7452fda4391..1a2653a9c7e1a55a86f12d25859c3d605ac90e10 100644
 --- a/python/sglang/srt/speculative/ngram_info.py
 +++ b/python/sglang/srt/speculative/ngram_info.py
-@@ -2,6 +2,7 @@ from __future__ import annotations
- 
- import copy
- import logging
-+import os
- from typing import Optional, Tuple
- 
- import torch
-@@ -68,7 +69,13 @@ class NgramVerifyInput(SpecInput):
+@@ -68,7 +68,13 @@ class NgramVerifyInput(SpecInput):
          self.retrive_next_token = retrive_next_token
          self.retrive_next_sibling = retrive_next_sibling
          self.draft_token_num = draft_token_num
@@ -1661,86 +1697,7 @@ index 7aafe98707694f96c5241123d6bfd7452fda4391..64088128cb648a2a3b45ef1e4d71148f
          self.grammar = grammar
  
      def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-@@ -277,6 +284,61 @@ class NgramVerifyInput(SpecInput):
-             triton.next_power_of_2(bs),
-         )
- 
-+    def _exact_block_repetition_penalty(
-+        self,
-+        sampling_info,
-+        logits_output: LogitsProcessorOutput,
-+        bs: int,
-+    ):
-+        """Correct the relaxed repetition penalty so it matches AR exactly (SELFSPEC_EXACT_PENALTY=1).
-+
-+        Logits row r predicts block[r+1]. When AR generates that token its penalty state is
-+        prefix + block[0..r]. The relaxed apply only included the prefix part, so row r must
-+        additionally account for block[0..r].
-+
-+        i=0 (the seed) is included too. The seed was probably accumulated in the previous round,
-+        but we do not rely on that: the `already` check prevents double application, so inclusion is safe.
-+        (Without i=0 the result is wrong whenever the seed is absent from base.)
-+
-+        Cost: only K(K-1)/2 (r,i) pairs are corrected (K=32 -> 496). Expanding the whole vocab per
-+        position ([bs,K,V]) would be ~155 MB at bs 8; advanced indexing does it in a handful of kernels.
-+        """
-+        orch = sampling_info.penalizer_orchestrator
-+        rp = None
-+        for cls, p in orch.penalizers.items():
-+            if cls.__name__ == "BatchedRepetitionPenalizer":
-+                rp = p
-+                break
-+        if rp is None or not getattr(rp, "_is_prepared", False):
-+            return
-+        base = rp.get_scaling_penalties()  # [bs, V] per-token scale (1.0 where no penalty applies)
-+        pen = rp.repetition_penalties  # [bs, 1]
-+        if base is None or base.shape[0] != bs:
-+            return
-+
-+        K = self.draft_token_num
-+        if K < 2:
-+            return
-+        L = logits_output.next_token_logits.view(bs, K, -1)
-+        cand = self.draft_token.view(bs, K).long()
-+        dev = L.device
-+
-+        # (r, i) with 0 <= i <= r  — K(K+1)/2 pairs (K=32 -> 528)
-+        key = (K, str(dev))
-+        cache = self.__dict__.setdefault("_ebp_idx", {})
-+        if key not in cache:
-+            rr, ii = torch.tril_indices(K, K, offset=0, device=dev)
-+            cache[key] = (rr.contiguous(), ii.contiguous())
-+        rr, ii = cache[key]
-+
-+        ar = torch.arange(bs, device=dev).unsqueeze(1)  # [bs,1]
-+        tok = cand[:, ii]  # [bs,P] token ids to correct
-+        row = rr.unsqueeze(0).expand(bs, -1)  # [bs,P] position within the block
-+        cur = L[ar, row, tok]  # [bs,P] current logit
-+        already = base[ar, tok] != 1.0  # tokens already penalized in base
-+        new = torch.where(cur < 0, cur * pen, cur / pen)  # same direction as apply_scaling_penalties
-+        L[ar, row, tok] = torch.where(already, cur, new)
-+
-     def _greedy_verify(
-         self,
-         batch: ScheduleBatch,
-@@ -412,6 +474,16 @@ class NgramVerifyInput(SpecInput):
-                         sampling_info.logit_bias, self.draft_token_num, dim=0
-                     )
-                 )
-+            # The apply above is "relaxed" (per the SGLang comment): all K block positions get the penalty
-+            # state from BEFORE the block. AR advances one token at a time, so at position r its state
-+            # also includes block[0..r]. That difference makes spec output diverge from AR, most on pages
-+            # where repetition occurs, which is exactly where the penalty matters.
-+            # -> below, the missing triangular share is added so the result matches AR exactly.
-+            # Safety: the repetition penalizer SETs values via scatter_, so it is idempotent; tokens already
-+            #      reflected in base (base != 1.0) are skipped to avoid double application.
-+            # Default OFF (stock relaxed behavior); enable with SELFSPEC_EXACT_PENALTY=1.
-+            if os.environ.get("SELFSPEC_EXACT_PENALTY", "0") == "1":
-+                self._exact_block_repetition_penalty(sampling_info, logits_output, bs)
- 
-         # Apply grammar mask
-         if vocab_mask is not None:
-@@ -439,6 +511,8 @@ class NgramVerifyInput(SpecInput):
+@@ -439,6 +445,8 @@ class NgramVerifyInput(SpecInput):
          self._fill_requests(batch, logits_output)
  
          accept_length_cpu = self.accept_length.cpu()
@@ -1750,18 +1707,19 @@ index 7aafe98707694f96c5241123d6bfd7452fda4391..64088128cb648a2a3b45ef1e4d71148f
  
          self._free_cache(batch, page_size, accept_length_cpu)
 diff --git a/python/sglang/srt/speculative/spec_info.py b/python/sglang/srt/speculative/spec_info.py
-index a40a8aa0dc333bfbe59cae8ab9d9a766847f2453..561830dae00f63949fec46f146b5283643e4993d 100644
+index a40a8aa0dc333bfbe59cae8ab9d9a766847f2453..f81baf218abc1cd9834744634af661753dd9b22f 100644
 --- a/python/sglang/srt/speculative/spec_info.py
 +++ b/python/sglang/srt/speculative/spec_info.py
-@@ -19,6 +19,7 @@ class SpeculativeAlgorithm(Enum):
-     EAGLE3 = auto()
+@@ -20,6 +20,8 @@ class SpeculativeAlgorithm(Enum):
      STANDALONE = auto()
      NGRAM = auto()
-+    SELFSPEC_DIFFUSION = auto()  # block-diffusion self-spec: bidir-block draft + AR verify (GLM-OCR)
      NONE = auto()
++    # after NONE, so every upstream member keeps its upstream value
++    SELFSPEC_DIFFUSION = auto()  # block-diffusion self-spec: bidir-block draft + AR verify (GLM-OCR)
  
      @classmethod
-@@ -46,6 +47,9 @@ class SpeculativeAlgorithm(Enum):
+     def from_string(cls, name: Optional[str]) -> SpeculativeAlgorithm:
+@@ -46,6 +48,9 @@ class SpeculativeAlgorithm(Enum):
      def is_ngram(self) -> bool:
          return self == SpeculativeAlgorithm.NGRAM
  
@@ -1771,7 +1729,7 @@ index a40a8aa0dc333bfbe59cae8ab9d9a766847f2453..561830dae00f63949fec46f146b52836
      def supports_spec_v2(self) -> bool:
          return self.is_eagle() or self.is_standalone()
  
-@@ -101,6 +105,16 @@ class SpeculativeAlgorithm(Enum):
+@@ -101,6 +106,16 @@ class SpeculativeAlgorithm(Enum):
              from sglang.srt.speculative.ngram_worker import NGRAMWorker
  
              return NGRAMWorker
@@ -1788,3 +1746,211 @@ index a40a8aa0dc333bfbe59cae8ab9d9a766847f2453..561830dae00f63949fec46f146b52836
  
          raise ValueError("Unreachable code path in create_worker.")
  
+diff --git a/python/sglang/srt/utils/auth.py b/python/sglang/srt/utils/auth.py
+index e7ef0767f12279da0411fc51ba9530d80d11c07c..dd9f3bc9ed140b80dc4e344be940fd46af401ad7 100644
+--- a/python/sglang/srt/utils/auth.py
++++ b/python/sglang/srt/utils/auth.py
+@@ -5,10 +5,11 @@ This module is intentionally lightweight (no torch import) so it can be used in
+ 
+ from __future__ import annotations
+ 
++import copy
+ import secrets
+ from dataclasses import dataclass
+ from enum import Enum
+-from typing import Any, Optional
++from typing import Any, Callable, Dict, Mapping, Optional
+ 
+ 
+ @dataclass(frozen=True)
+@@ -146,63 +147,137 @@ def decide_request_auth(
+     return AuthDecision(allowed=True)
+ 
+ 
+-def add_api_key_middleware(
+-    app,
+-    *,
+-    api_key: Optional[str],
+-    admin_api_key: Optional[str],
+-):
+-    """Add middleware for three endpoint auth levels: normal/admin_optional/admin_force."""
+-    # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
+-    from fastapi.responses import ORJSONResponse
+-    from starlette.requests import Request
+-
+-    class _ApiKeyASGIMiddleware:
+-        """ASGI-native middleware to preserve client disconnect events."""
+-
+-        def __init__(self, app, *, api_key, admin_api_key, fastapi_app):
+-            self.app = app
+-            self.api_key = api_key
+-            self.admin_api_key = admin_api_key
+-            self.fastapi_app = fastapi_app
+-
+-        async def __call__(self, scope, receive, send):
+-            if scope["type"] != "http":
++# ---------------------------------------------------------------- secrets in the server arguments
++# ServerArgs fields that hold secrets. They are never returned by an endpoint (/server_info,
++# /get_server_info, the scheduler's internal state), never logged (ServerArgs declares them with
++# repr=False) and never written to the multi-tokenizer shared-memory segment.
++SECRET_SERVER_ARG_FIELDS = ("api_key", "admin_api_key", "ssl_keyfile_password")
++
++
++def redact_server_args(server_args: Mapping[str, Any]) -> Dict[str, Any]:
++    """A copy of a server-arguments dict (`dataclasses.asdict` / `vars` of ServerArgs) with every
++    secret field set to None. The input is not modified."""
++    redacted = dict(server_args)
++    for name in SECRET_SERVER_ARG_FIELDS:
++        if name in redacted:
++            redacted[name] = None
++    return redacted
++
++
++def server_args_without_secrets(server_args: Any) -> Any:
++    """A shallow copy of a ServerArgs object with every secret field set to None (the object is not
++    re-initialised, so `__post_init__` does not run again). The input is not modified."""
++    stripped = copy.copy(server_args)
++    for name in SECRET_SERVER_ARG_FIELDS:
++        if hasattr(stripped, name):
++            setattr(stripped, name, None)
++    return stripped
++
++
++class _FixedKeys:
++    __slots__ = ("api_key", "admin_api_key")
++
++    def __init__(self, api_key: Optional[str], admin_api_key: Optional[str]):
++        self.api_key = api_key
++        self.admin_api_key = admin_api_key
++
++
++class _ApiKeyASGIMiddleware:
++    """ASGI-native middleware to preserve client disconnect events.
++
++    `keys()` returns the keys to enforce (an object with `api_key` and `admin_api_key`), or None while
++    they are not known in this process (a tokenizer worker before its keys are set); then only OPTIONS,
++    /health* and /metrics* pass and every other request gets 503, so no worker ever serves without its
++    keys. With no keys and no ADMIN_FORCE endpoint, every request passes straight through (upstream
++    installs no middleware in that case).
++    """
++
++    def __init__(self, app, *, keys: Callable[[], Any], fastapi_app):
++        # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
++        from fastapi.responses import ORJSONResponse
++        from starlette.requests import Request
++
++        self.app = app
++        self.keys = keys
++        self.fastapi_app = fastapi_app
++        self._response_cls = ORJSONResponse
++        self._request_cls = Request
++        self._has_admin_force: Optional[bool] = None
++
++    async def __call__(self, scope, receive, send):
++        if scope["type"] != "http":
++            await self.app(scope, receive, send)
++            return
++
++        keys = self.keys()
++        if keys is not None and not (keys.api_key or keys.admin_api_key):
++            if self._has_admin_force is None:  # the routes are complete once requests arrive
++                self._has_admin_force = app_has_admin_force_endpoints(self.fastapi_app)
++            if not self._has_admin_force:
+                 await self.app(scope, receive, send)
+                 return
+ 
+-            request = Request(scope, receive=receive)
+-            path = request.url.path
+-            authz = request.headers.get("Authorization")
+-            level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
+-            decision = decide_request_auth(
+-                method=request.method,
+-                path=path,
+-                authorization_header=authz,
+-                api_key=self.api_key,
+-                admin_api_key=self.admin_api_key,
+-                auth_level=level,
++        request = self._request_cls(scope, receive=receive)
++        path = request.url.path
++        if keys is None:
++            if (
++                request.method == "OPTIONS"
++                or path.startswith("/health")
++                or path.startswith("/metrics")
++            ):
++                await self.app(scope, receive, send)
++                return
++            response = self._response_cls(
++                content={"error": "Service Unavailable: API keys not configured"},
++                status_code=503,
+             )
++            await response(scope, receive, send)
++            return
++
++        authz = request.headers.get("Authorization")
++        level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
++        decision = decide_request_auth(
++            method=request.method,
++            path=path,
++            authorization_header=authz,
++            api_key=keys.api_key,
++            admin_api_key=keys.admin_api_key,
++            auth_level=level,
++        )
++
++        if not decision.allowed:
++            response = self._response_cls(
++                content={
++                    "error": (
++                        "Unauthorized"
++                        if decision.error_status_code == 401
++                        else "Forbidden"
++                    )
++                },
++                status_code=decision.error_status_code,
++            )
++            await response(scope, receive, send)
++            return
+ 
+-            if not decision.allowed:
+-                response = ORJSONResponse(
+-                    content={
+-                        "error": (
+-                            "Unauthorized"
+-                            if decision.error_status_code == 401
+-                            else "Forbidden"
+-                        )
+-                    },
+-                    status_code=decision.error_status_code,
+-                )
+-                await response(scope, receive, send)
+-                return
++        await self.app(scope, receive, send)
+ 
+-            await self.app(scope, receive, send)
+ 
+-    app.add_middleware(
+-        _ApiKeyASGIMiddleware,
+-        api_key=api_key,
+-        admin_api_key=admin_api_key,
+-        fastapi_app=app,
+-    )
++def install_auth_middleware(app, *, keys: Callable[[], Any]) -> None:
++    """Add the auth middleware with a key provider that it calls per request.
++
++    http_server calls it once on its module-level app, with http_worker_keys.get_auth_keys, so every
++    tokenizer worker process (each imports that module) has it. Starlette accepts middleware only
++    before the app starts, while a worker learns its keys only at startup: hence the provider.
++    """
++    app.add_middleware(_ApiKeyASGIMiddleware, keys=keys, fastapi_app=app)
++
++
++def add_api_key_middleware(
++    app,
++    *,
++    api_key: Optional[str],
++    admin_api_key: Optional[str],
++):
++    """Add middleware for three endpoint auth levels: normal/admin_optional/admin_force, with fixed keys."""
++    fixed = _FixedKeys(api_key, admin_api_key)
++    app.add_middleware(_ApiKeyASGIMiddleware, keys=lambda: fixed, fastapi_app=app)

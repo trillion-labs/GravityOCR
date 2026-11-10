@@ -2,7 +2,7 @@
 # One-command SGLang HTTP server for a GLM-OCR block-diffusion checkpoint — AR or our self-spec.
 # Bakes in EVERY gotcha this project hit (see serve/SGLANG_SERVE.md). Another session can just run this.
 #
-#   bash serve/serve_sglang_ocr.sh MODE=spec GPU=0 PORT=30000          # our block-diffusion self-spec (lossless)
+#   bash serve/serve_sglang_ocr.sh MODE=spec GPU=0 PORT=30000          # our block-diffusion self-spec
 #   bash serve/serve_sglang_ocr.sh MODE=ar   GPU=1 PORT=30001          # plain AR baseline
 #   (optional) CKPT=<hf checkpoint dir or hub id>   (default = trillionlabs/GravityOCR)
 #
@@ -46,10 +46,14 @@ GRAPHBS_ARG=""; [ -n "${GRAPHBS:-}" ] && GRAPHBS_ARG="--cuda-graph-max-bs $GRAPH
 SPEC_ARGS=""
 if [ "$MODE" = "spec" ]; then
   # our block-diffusion self-spec — needs the SELFSPEC_DIFFUSION CLI choice patched into server_args.py
-  # (patches/sglang, applied to the SGLang checkout $VBIN was built from) + page_size 1. Lossless == AR-greedy.
+  # (patches/sglang, applied to the SGLang checkout $VBIN was built from) + page_size 1. The AR head checks
+  # every committed token; the output follows AR decoding up to the position layout (SELFSPEC_POS_OFFSET
+  # below) and bf16 near-ties (serve/SGLANG_SERVE.md section 2).
   SPEC_ARGS="--speculative-algorithm SELFSPEC_DIFFUSION --speculative-num-draft-tokens ${DRAFT:-33} --page-size 1"
-  # GLM-OCR positions (x0 at the AR position + 1) and mask id. A checkpoint dir with block_diffusion.json supplies
-  # the mask id itself; a hub id or a dir without that file gets GLM-OCR's <|mask|>.
+  # GLM-OCR positions (x0 and every later generated token at the AR position + 1, the layout the released
+  # self-spec results were produced with; SELFSPEC_POS_OFFSET=0 = the AR / training layout) and mask id. A
+  # checkpoint dir with block_diffusion.json supplies the mask id itself; a hub id or a dir without that file
+  # gets GLM-OCR's <|mask|>.
   export SELFSPEC_FULLDRAFT="${SELFSPEC_FULLDRAFT:-1}" SELFSPEC_POS_OFFSET="${SELFSPEC_POS_OFFSET:-1}"
   [ -f "$CKPT/block_diffusion.json" ] || export SELFSPEC_MASK_ID="${SELFSPEC_MASK_ID:-59282}"
 fi

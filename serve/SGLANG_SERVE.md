@@ -1,8 +1,9 @@
 # Serving with SGLang — self-speculative (spec) and autoregressive (ar) modes
 
 `serve/serve_sglang_ocr.sh` serves the same checkpoint either way over an OpenAI-compatible HTTP
-endpoint. `MODE=spec` is block-diffusion self-speculative decoding (lossless, faster); `MODE=ar` is
-plain autoregressive decoding and exists for direct comparison.
+endpoint. `MODE=spec` is block-diffusion self-speculative decoding: every committed token is checked
+by the model's own AR head, so the output follows AR decoding up to the position layout and bf16
+near-ties described in §2. `MODE=ar` is plain autoregressive decoding and exists for direct comparison.
 
 ## 1. One command
 
@@ -24,9 +25,13 @@ worker processes preprocess regions in parallel; in spec mode additionally the m
 cache fix, the GPU-side commit, host-side lengths, device-side positions and the draft launched ahead of the host
 bookkeeping. The output is bit-identical to `FAST=0`, which serves the unoptimized runtime. Any single flag can be
 overridden from the environment (e.g. `SELFSPEC_DRAFT_AHEAD=0`), and `EXTRA_ARGS` is appended to `launch_server`.
-The ViT graphs lengthen startup and take a few GB of GPU memory away from the KV cache. Spec mode also sets
-`SELFSPEC_POS_OFFSET=1` (the positions GLM-OCR checkpoints are served with) and, when `CKPT` has no local
-`block_diffusion.json` (e.g. a hub id), `SELFSPEC_MASK_ID=59282` (`docs/SGLANG_SELFSPEC_IMPL.md` §9-1, §10).
+The ViT graphs lengthen startup and, because they are captured before SGLang sizes the KV cache, take about 3.3 GB
+of GPU memory from it (on an 80 GB H100 about 7.7% of the KV pool at `MEMFRAC=0.6`). `SS_GLM_VIT_GRAPH_MAXM=0` gives
+it back; a capture that fails (e.g. out of memory) is logged as `[ss-vit-graph] OFF: capture failed (...)` and the
+server continues with the eager ViT, with the same output (`docs/SGLANG_SELFSPEC_IMPL.md` §7-5, §10). Spec mode also
+sets `SELFSPEC_POS_OFFSET=1`, which puts every generated token one RoPE position after where AR decoding and training
+put it (the layout the released self-spec results were produced with; `0` is the AR layout, §2), and, when `CKPT` has
+no local `block_diffusion.json` (e.g. a hub id), `SELFSPEC_MASK_ID=59282` (`docs/SGLANG_SELFSPEC_IMPL.md` §9-1, §10).
 
 The launcher bakes in the gotchas that each cost a debugging cycle:
 1. **venv bin on PATH** — flashinfer cuda-graph capture shells out to `ninja`; missing → capture dies with
@@ -43,17 +48,33 @@ The launcher bakes in the gotchas that each cost a debugging cycle:
 Spec mode runs the **full-draft round** by default (`SELFSPEC_FULLDRAFT=1`): the draft window is the boundary
 token plus 32 masks, every mask logit is used, and a fully accepted draft also commits the verifier's bonus
 token, so a round commits up to K+1 = 34 tokens and reserves K+1 KV slots per request. `SELFSPEC_FULLDRAFT=0`
-selects the legacy round (at most K = 33 tokens). Both are lossless — the parity check in §2 holds for either
-(`docs/SGLANG_SELFSPEC_IMPL.md` §2).
+selects the legacy round (at most K = 33 tokens). Both verify every token the same way, so the parity check in §2
+holds for either (`docs/SGLANG_SELFSPEC_IMPL.md` §2).
 
 The endpoint is a standard `/v1/chat/completions`: send `{image_url: data:image/png;base64,..., text:
-"<task prompt>"}` with `temperature: 0`. Task prompts follow GLM-OCR (`Text Recognition:`,
-`Table Recognition:`, `Formula Recognition:`), one request per layout region.
+"<task prompt>"}` with `temperature: 0` (greedy, what the released results use). Task prompts follow GLM-OCR
+(`Text Recognition:`, `Table Recognition:`, `Formula Recognition:`), one request per layout region. Spec mode
+also serves sampling settings, penalties, `logit_bias`, `min_tokens` and structured output (`response_format`)
+with AR's semantics (`docs/SGLANG_SELFSPEC_IMPL.md` §9-6, §9-7). It does not serve `logprobs` in the default
+full-draft round: such a request stops the server, so send it to `MODE=ar`.
 
-## 2. Parity check (spec ≡ AR)
+**Security.** The launcher binds `127.0.0.1` and sets no API or admin key, so every user on the host can reach
+SGLang's management endpoints (weight reloads from a caller-chosen path, profiling, cache control). On a shared host
+give the server keys through a mode-0600 YAML file, `EXTRA_ARGS="--config <file>"` with `api-key:` and
+`admin-api-key:` entries, rather than on the command line. The patch makes every tokenizer worker check them (upstream
+v0.5.10 checks keys only with one worker), and `/server_info` / `/get_server_info` return the configuration with
+both keys blanked.
 
-Run the same crops through `MODE=ar` and `MODE=spec` and compare **token ids**, not text. They must be
-identical with `repetition_penalty` off (see `docs/SGLANG_SELFSPEC_IMPL.md` §9-7 and §11). Acceptance
+## 2. Parity check (spec vs AR)
+
+Run the same crops through `MODE=ar` and `MODE=spec` and compare **token ids**, not text. Two things separate
+them. With the launcher's `SELFSPEC_POS_OFFSET=1`, every generated token sits one RoPE position after where AR
+decoding puts it, so spec verifies against the AR head under that shifted layout; at that layout the two modes
+agree on 96.6% of 8,922 region crops. And the verify forward scores K positions at once with other kernels than
+AR's one-token steps, so a bf16 near-tie can resolve differently. For a parity check start spec mode with
+`SELFSPEC_POS_OFFSET=0` (the AR layout) and AR mode with `EXTRA_ARGS=--disable-overlap-schedule` (SGLang's overlap
+scheduler counts each token for the penalties one step late); then every difference must be a near-tie
+(`docs/SGLANG_SELFSPEC_IMPL.md` §9-6, §9-7 and §11). Acceptance
 statistics are available from `Engine.get_server_info()["internal_states"]`
 (`avg_spec_accept_length`; tok/fwd = that value / 2); a server driven through the Python API can
 re-export it as an `/internal_state/` route.
@@ -65,7 +86,8 @@ assemble `<stem>.md` → official scorer. Detection is deterministic and engine-
 precomputed once with `tools/precompute_odb_layout.py`; an HTTP client then sends each page's crops
 concurrently to the server (the server batches them), assembles the page with
 `infer_omnidocbench.assemble_page`, and the result is scored with `slurm/score_finalize.slurm`
-(`RD=<run dir>`). Both `MODE=ar` and `MODE=spec` give the same predictions; the difference is speed.
+(`RD=<run dir>`). `MODE=ar` and `MODE=spec` give the same predictions up to the differences in §2; the
+difference that matters is speed.
 
 ## 4. Throughput
 
@@ -85,5 +107,5 @@ the next round's draft is launched before the current round's host bookkeeping s
 time. Multi-GPU data parallelism is the lever for aggregate throughput.
 
 The older `SELFSPEC_NOMASK=1` path is a different experiment and stays off: a dual-graph mask-free path that read a
-stale captured mask buffer under cuda graphs and broke losslessness. The `FAST=1` attention path does not share that
-mechanism (`docs/SGLANG_SELFSPEC_IMPL.md` §7-1).
+stale captured mask buffer under cuda graphs, and its output diverged from AR. The `FAST=1` attention path does not
+share that mechanism (`docs/SGLANG_SELFSPEC_IMPL.md` §7-1).

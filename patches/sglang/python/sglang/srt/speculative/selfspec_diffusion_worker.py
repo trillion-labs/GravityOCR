@@ -1,3 +1,6 @@
+# Portions Copyright 2023-2024 SGLang Team, licensed under the Apache License, Version 2.0 (the notice of SGLang's
+# LICENSE; sglang/srt/speculative/ngram_info.py has no per-file notice): the n-gram verify and accept bookkeeping
+# is adapted from ngram_info.py (SGLang v0.5.10).
 """Block-diffusion SELF-speculative decoding worker for SGLang (GLM-OCR).
 
 natcache (src/fast_sampling.py) per round:
@@ -24,6 +27,7 @@ from typing import Optional
 import numpy as np
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -31,24 +35,105 @@ from sglang.srt.mem_cache.common import alloc_token_slots
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
-from sglang.srt.speculative.selfspec_fast_commit import SelfSpecFastCommit, verify_logits
+from sglang.srt.speculative.selfspec_fast_commit import (
+    SelfSpecFastCommit,
+    cumulate_committed,
+    grammar_accept_or_abort,
+    verify_logits,
+)
+from sglang.srt.speculative.selfspec_sampling import (
+    KNOWN_PENALIZERS,
+    chain_retrieve_cpu,
+    fulldraft_bitmask,
+    is_plain,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import generate_token_bitmask, traverse_tree
 
 logger = logging.getLogger(__name__)
 _DBG = os.environ.get("SELFSPEC_DEBUG", "0") == "1"
 
 
-class _FullDraftVerifyInput(NgramVerifyInput):
+class _SelfSpecVerifyMixin:
+    """verify() of the self-spec verify inputs (full-draft and legacy round).
+
+    A batch that uses no sampling feature (ss_plain, set by the worker from selfspec_sampling.is_plain) runs the inherited
+    NgramVerifyInput.verify unchanged. Any other batch gets the AR-exact target decision (selfspec_fast_commit.verify_logits:
+    in-block penalties, grammar mask, logit_bias and custom processors per row, AR's greedy rule or exact speculative sampling),
+    then its committed tokens are fed to the penalizers, then the inherited bookkeeping tail (_fill_requests, _free_cache, lengths).
+    The worker sets ss_plain / ss_cand_cpu (host verify ids, custom-processor batches only) / ss_in_block_start on every instance."""
+
+    ss_plain = True
+    ss_cand_cpu = None
+    ss_in_block_start = 0
+
+    def verify(self, batch: ScheduleBatch, logits_output, page_size: int, vocab_mask: Optional[torch.Tensor] = None):
+        if self.ss_plain:
+            return super().verify(batch, logits_output, page_size, vocab_mask)
+        verify_logits(self, batch, logits_output, vocab_mask, plain=False, cand_cpu=self.ss_cand_cpu,
+                      in_block_start=self.ss_in_block_start)
+        cumulate_committed(self, batch)
+        # from here verbatim the tail of NgramVerifyInput.verify (this tree's copy keeps accept_length_cpu for the caller)
+        self._fill_requests(batch, logits_output)
+        accept_length_cpu = self.accept_length.cpu()
+        self.accept_length_cpu = accept_length_cpu
+        num_accepted_tokens = accept_length_cpu.sum().item()
+        self._free_cache(batch, page_size, accept_length_cpu)
+        batch.seq_lens.add_(self.accept_length + 1)
+        batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+        return logits_output, self.verified_id, num_accepted_tokens
+
+
+class _LegacyVerifyInput(_SelfSpecVerifyMixin, NgramVerifyInput):
+    """Verify input for the legacy round (SELFSPEC_FULLDRAFT=0): the n-gram chain [x0, d1..d_{K-1}] with the self-spec verify()
+    above. _fill_requests is NgramVerifyInput's, except that a grammar rejection aborts the request (as SGLang's AR output
+    processor does) instead of raising inside the scheduler."""
+
+    ss_in_block_start = 1   # cand[0] = x0 is already in output_ids
+
+    def _fill_requests(self, batch: ScheduleBatch, logits_output):
+        accept_index_cpu = self.accepted_indices.tolist()
+        predict_cpu = self.predict.tolist()
+        has_finished = False
+        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+            for j, idx in enumerate(accept_index_row):
+                if idx == -1:
+                    break
+                id = predict_cpu[idx]
+                req.output_ids.append(id)
+                req.check_finished()
+                if req.finished() or (req.grammar is not None and not grammar_accept_or_abort(req, id)):
+                    has_finished = True
+                    self.accepted_indices[i, j + 1 :] = -1
+                    break
+            req.spec_verify_ct += 1
+            accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
+            req.spec_accepted_tokens += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
+
+        if has_finished:
+            self.accept_length = (self.accepted_indices != -1).sum(dim=1) - 1
+        self.accepted_indices = self.accepted_indices[self.accepted_indices != -1]
+
+        logits_output.next_token_logits = logits_output.next_token_logits[self.accepted_indices]
+        if logits_output.hidden_states:
+            logits_output.hidden_states = logits_output.hidden_states[self.accepted_indices]
+        self.verified_id = self.predict[self.accepted_indices]
+
+
+class _FullDraftVerifyInput(_SelfSpecVerifyMixin, NgramVerifyInput):
     """Verify input for the full-draft round (SELFSPEC_FULLDRAFT=1, the default).
 
-    The one difference from the legacy round: a0 (the causal-logit argmax of the seed x0) is committed
-    unconditionally, independent of verification. The chain root is a0 rather than x0 and the candidates
+    The one difference from the legacy round: a0 (the seed x0's next token, drawn from the draft's causal row: its argmax for a
+    greedy batch, SGLang's sampler with the request's settings otherwise) is committed unconditionally, independent of
+    verification. The chain root is a0 rather than x0 and the candidates
     are d1..d_{K-1} (all K-1 mask logits), so a round commits a0 + accepted prefix + bonus = accept_length + 2 (at most K+1).
 
     a0 is already committed and not part of the verify chain, so `_fill_requests` must append a0 and check
     finish BEFORE appending the verified tokens to output_ids. If a0 is EOS (or hits the length limit)
     the request ends at a0 and every verify token is dropped -- the same mechanism SGLang uses for an EOS
     in the middle of the candidates (clearing the trailing accepted_indices to -1), applied to the whole row.
+    A grammar rejection of a committed token aborts the request (AR parity) instead of raising inside the scheduler.
 
     KV accounting: x0's K/V is what the draft forward wrote causally into slot(p0); it is kept as is (no recompute).
     That slot is not in verify's out_cache_loc, so `_free_cache` leaves it alone, and the worker adds 1 to
@@ -66,15 +151,9 @@ class _FullDraftVerifyInput(NgramVerifyInput):
         for i, req in enumerate(batch.reqs):
             req.output_ids.append(a0_cpu[i])
             req.check_finished()
-            if req.finished():
+            if req.finished() or (req.grammar is not None and not grammar_accept_or_abort(req, a0_cpu[i])):
                 has_finished = True
                 self.accepted_indices[i, :] = -1  # this request ends at a0 -- drop every verify token
-            elif req.grammar is not None:
-                try:
-                    req.grammar.accept_token(a0_cpu[i])
-                except ValueError as e:
-                    logger.info(f"{i=}, {req=} a0={a0_cpu[i]}")
-                    raise e
         # (2) from here identical to NgramVerifyInput._fill_requests (accepted_draft_tokens is +1: a0 is a committed token too).
         accept_index_cpu = self.accepted_indices.tolist()
         predict_cpu = self.predict.tolist()
@@ -85,21 +164,10 @@ class _FullDraftVerifyInput(NgramVerifyInput):
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
                 req.check_finished()
-                if req.finished():
+                if req.finished() or (req.grammar is not None and not grammar_accept_or_abort(req, id)):
                     has_finished = True
                     self.accepted_indices[i, j + 1 :] = -1
                     break
-                else:
-                    if req.grammar is not None:
-                        try:
-                            req.grammar.accept_token(id)
-                        except ValueError as e:
-                            logger.info(
-                                f"{i=}, {req=}\n"
-                                f"{self.accepted_indices=}\n"
-                                f"{self.predict=}\n"
-                            )
-                            raise e
             req.spec_verify_ct += 1  # exactly 1 per round (keeps tok/fwd = toks/(2*verify_ct))
             # SGLang convention: accepted_draft_tokens = tokens committed this round - 1. Committed = 1 (a0) + kept verified.
             accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1)
@@ -136,12 +204,13 @@ class _DraftStash:
     __slots__ = ("batch", "reqs", "rpi", "seq_lens", "rpi_host", "sl", "cache_loc", "am")
 
 
-def _resolve_block_diffusion(server_args: ServerArgs, dllm_cfg):
+def _resolve_block_diffusion(server_args: ServerArgs):
     """Mask id / bd_size of the served export.
 
     A hard-coded 59282 fallback (GLM-OCR's <|mask|>) would, for any other export, silently turn the draft
     into garbage: verify still keeps the output == AR, so the only symptom is accept ~1. Order: SELFSPEC_MASK_ID
-    env > <model_path>/block_diffusion.json > --dllm-algorithm config; nothing found -> error (no silent fallback)."""
+    env > <model_path>/block_diffusion.json; nothing found -> error (no silent fallback). (--dllm-algorithm, SGLang's
+    diffusion-LLM scheduling, is refused together with SELFSPEC_DIFFUSION by ServerArgs, so it is no source here.)"""
     bd_size = None
     path = os.path.join(str(server_args.model_path), "block_diffusion.json")
     bd = None
@@ -154,11 +223,45 @@ def _resolve_block_diffusion(server_args: ServerArgs, dllm_cfg):
         return int(env), bd_size, "env SELFSPEC_MASK_ID"
     if bd is not None and "mask_id" in bd:
         return int(bd["mask_id"]), bd_size, path
-    if dllm_cfg is not None:
-        return int(dllm_cfg.mask_id), bd_size, "dllm_config"
     raise ValueError(
         f"SELFSPEC_DIFFUSION: no mask id — {path} missing/without mask_id and SELFSPEC_MASK_ID unset"
     )
+
+
+# Grammar backends whose grammar objects support what the verify rows need: accept / rollback along the draft chain and the packed
+# int32 token bitmask that spec_utils.traverse_tree reads (the same requirement as SGLang's EAGLE / n-gram verify with a grammar).
+_SELFSPEC_GRAMMAR_BACKENDS = ("xgrammar", "llguidance", "none")
+
+
+def _check_sampling_support(server_args: ServerArgs):
+    """Start-up checks for the AR-exact sampling / penalty / grammar semantics of the self-spec round (see selfspec_sampling)."""
+    import sglang.srt.sampling.penaltylib as penaltylib
+    from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
+
+    seen, todo = set(), list(_BatchedPenalizer.__subclasses__())
+    while todo:
+        c = todo.pop()
+        if c.__name__ not in seen:
+            seen.add(c.__name__)
+            todo.extend(c.__subclasses__())
+    if not seen <= KNOWN_PENALIZERS or not KNOWN_PENALIZERS <= set(penaltylib.__all__):
+        raise ValueError(
+            f"SELFSPEC_DIFFUSION: the in-block penalty rows and the per-token cumulation know the penalizers {sorted(KNOWN_PENALIZERS)}; "
+            f"this SGLang defines {sorted(seen)}. Extend speculative/selfspec_sampling.py for the new one."
+        )
+    th = (server_args.speculative_accept_threshold_single, server_args.speculative_accept_threshold_acc)
+    if th != (1.0, 1.0):
+        raise ValueError(
+            f"SELFSPEC_DIFFUSION samples exactly from the AR distribution only with --speculative-accept-threshold-single 1.0 and "
+            f"--speculative-accept-threshold-acc 1.0 (got {th[0]}, {th[1]})"
+        )
+    gb = server_args.grammar_backend or "xgrammar"
+    if gb not in _SELFSPEC_GRAMMAR_BACKENDS:
+        raise ValueError(
+            f"SELFSPEC_DIFFUSION verifies a draft chain under the request's grammar, which needs a grammar backend with rollback and "
+            f"the packed token bitmask: {', '.join(_SELFSPEC_GRAMMAR_BACKENDS)} (got --grammar-backend {gb}; SGLang's EAGLE / n-gram "
+            f"verify has the same requirement). The default, xgrammar, has both."
+        )
 
 
 class SelfSpecDiffusionWorker:
@@ -181,10 +284,7 @@ class SelfSpecDiffusionWorker:
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
-        from sglang.srt.dllm.config import DllmConfig
-
-        dllm_cfg = DllmConfig.from_server_args(server_args)
-        self.mask_id, self._bd_size, self._mask_src = _resolve_block_diffusion(server_args, dllm_cfg)
+        self.mask_id, self._bd_size, self._mask_src = _resolve_block_diffusion(server_args)
         vocab = getattr(target_worker.model_config, "vocab_size", None)
         if vocab is not None and not (0 <= self.mask_id < vocab):
             raise ValueError(f"SELFSPEC_DIFFUSION: mask_id {self.mask_id} outside vocab {vocab}")
@@ -212,8 +312,9 @@ class SelfSpecDiffusionWorker:
         # Positions are AR-ALIGNED by default: x0 (row 0) gets
         # len(origin)+len(output)-1 == batch.seq_lens == the position AR decode gives the same token
         # (forward_batch_info: clamp_position(seq_lens_after_prepare) = seq_lens_after_prepare-1).
-        # The legacy GLM positions were len(origin)+len(output) (= AR+1) — harmless-looking under GLM's M-RoPE delta,
-        # but with a plain 1-D RoPE that shifts every generated token one slot vs the prompt.
+        # The legacy GLM positions were len(origin)+len(output) (= AR+1). The spec M-RoPE positions are these plus
+        # mrope_position_delta, so for GLM too every generated token sits one slot further from the prompt than in AR
+        # decoding and in training.
         # SELFSPEC_POS_OFFSET is added on top (SELFSPEC_POS_OFFSET=1 reproduces the legacy GLM positions).
         self._pos_offset = int(os.environ.get("SELFSPEC_POS_OFFSET", "0"))
         self._pos_checked = False
@@ -240,6 +341,7 @@ class SelfSpecDiffusionWorker:
             # FULLDRAFT=0: a K vs K + 1 size mismatch in set_kv_buffer / replay_prepare). Refuse at startup.
             raise ValueError("SELFSPEC_TRAIN_MASKS=1 is broken in this worker on both attention paths (verify reuses the draft's "
                              "K + 1 KV slots); not supported with SELFSPEC_FASTATTN=1")
+        _check_sampling_support(server_args)
         # SELFSPEC_CHECK=1: per-round host/device length asserts (syncs; diagnostic only, see _check_lens)
         self._check = os.environ.get("SELFSPEC_CHECK", "0") == "1"
         self._n_checked = 0
@@ -353,6 +455,30 @@ class SelfSpecDiffusionWorker:
             size = self.target_worker.model_runner.req_to_token_pool.size
             self._seed_pool = torch.zeros(size, dtype=torch.int64, device=self._seed_pool_dev)
         return self._seed_pool
+
+    @staticmethod
+    def _plain(batch: ScheduleBatch) -> bool:
+        """selfspec_sampling.is_plain: every request greedy, no penalties / logit_bias / custom processor / grammar. Host attributes
+        only. A plain batch runs the greedy round unchanged (a0 = the draft argmax, verify on the raw logits, no cumulation)."""
+        return is_plain(batch.sampling_info, batch.has_grammar)
+
+    def _sample_a0(self, batch: ScheduleBatch, logits: torch.Tensor) -> torch.Tensor:
+        """Non-plain batch: a0 = SGLang's own sampler on the draft's causal row 0 (the AR logits of the token after the seed x0),
+        exactly as AR decode samples that token: model_runner._preprocess_logits (grammar vocab mask from each request's current
+        state, penalties from every committed token, logit_bias) and model_runner.sampler (custom logit processors, greedy /
+        temperature / top-k / top-p / min-p; positions = x0's position, the value AR passes for the same draw, which only
+        --enable-deterministic-inference's per-request seeds read). a0 is then fed to the penalizers, one token per request, as AR
+        feeds every sampled token. si.grammars was set by get_model_worker_batch() before the draft forward.
+        (The verify rows' speculative sampling draws its coins from the device RNG, as SGLang's EAGLE / n-gram verify does: the
+        committed tokens follow AR's distribution, but per-request sampling seeds do not reproduce them token for token.)"""
+        si = batch.sampling_info
+        lo = LogitsProcessorOutput(next_token_logits=logits[:, 0].float().clone())   # a copy: the draft logits may be a graph buffer
+        self.model_runner._preprocess_logits(lo, si)
+        a0 = self.model_runner.sampler(lo, si, False, None, None, batch.seq_lens).to(torch.int64)
+        orch = si.penalizer_orchestrator
+        if orch is not None and orch.is_required:
+            orch.cumulate_output_tokens(a0)
+        return a0
 
     def _chain_retrieve(self, bs: int, n: int):
         """Three constant tensors that depend only on (bs, n): no reason to rebuild them every round (and for
@@ -574,6 +700,10 @@ class SelfSpecDiffusionWorker:
         # With n=K+1 (SELFSPEC_TRAIN_MASKS=1) there is an extra row K that predicts the first token of the
         #   NEXT block; it is unused this round. The draft slice (:K-1) stays valid.
         am = logits.argmax(-1)  # [bs, n]
+        if self._fulldraft and not self._plain(batch):
+            # a0 (= am[:, 0], the verify chain's root) is committed unconditionally: draw it as AR decode would. The draft tokens
+            # d1.. stay the argmax of the mask rows (a deterministic draft; the verify makes the committed tokens AR samples).
+            am[:, 0] = self._sample_a0(batch, logits)
         if self._dev_ids:
             # SELFSPEC_DEV_POS=1, full draft: the verify input [a0, d1..d_{K-1}] == am[:, :K] and n == K (the fast
             # path refuses SELFSPEC_TRAIN_MASKS), so _fulldraft_verify takes am itself; `draft` ([seed | am[:, :K-1]]) is not assembled.
@@ -680,8 +810,12 @@ class SelfSpecDiffusionWorker:
             verify_tokens = am.view(-1)
         else:
             d = draft_tokens.view(bs, K)
-            a0 = d[:, 1]                                          # causal-logit argmax of x0 (draft[:, 1])
+            a0 = d[:, 1]                                          # x0's next token from the draft's causal row (draft[:, 1])
             verify_tokens = torch.cat([d[:, 1:], self._last_dK.view(bs, 1)], dim=1).flatten()  # [a0,d1..d_{K-1}]
+        plain = self._plain(batch)
+        si = batch.sampling_info
+        # host copy of the verify ids, only for a batch with a grammar (bitmask rows) or a custom logit processor (request views)
+        vt_cpu = verify_tokens.view(bs, K).cpu() if (not plain and (batch.has_grammar or si.has_custom_logit_processor)) else None
 
         ri, nt, ns = self._chain_retrieve(bs, K)
         pos = self._positions(batch, K, extra=1)              # p0+1 .. p0+K (draft window positions +1)
@@ -710,6 +844,8 @@ class SelfSpecDiffusionWorker:
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         spec = _FullDraftVerifyInput(verify_tokens, custom_mask, pos, ri, nt, ns, K)
         spec.a0 = a0
+        spec.ss_plain = plain
+        spec.ss_cand_cpu = vt_cpu.tolist() if (vt_cpu is not None and si.has_custom_logit_processor) else None
         spec.selfspec_causal = True if self._nomask else None
         if self._fastattn:
             spec.selfspec_role = "verify"
@@ -722,10 +858,18 @@ class SelfSpecDiffusionWorker:
         mwb = batch.get_model_worker_batch()
         batch_result = self.target_worker.forward_batch_generation(mwb, is_verify=True)
         verify_input: _FullDraftVerifyInput = mwb.spec_info
+        vocab_mask = None
+        if batch.has_grammar:
+            # built on the host while the verify forward runs (as the n-gram worker does); row j = grammar state after a0, d1..dj
+            mask, grammar = fulldraft_bitmask(batch.reqs, vt_cpu, si.vocab_size, traverse_tree)
+            if mask is not None:
+                verify_input.grammar = grammar
+                vocab_mask = grammar.move_vocab_mask(mask, dev)
+            si.vocab_mask = None   # never let a stale mask from an earlier forward be reused
         if self._fast_commit and not batch.return_hidden_states:
-            return self._fast_commit_round(batch, verify_input, batch_result)
+            return self._fast_commit_round(batch, verify_input, batch_result, plain, vocab_mask)
         logits_output, vid, _ = verify_input.verify(
-            batch, batch_result.logits_output, self.page_size, None
+            batch, batch_result.logits_output, self.page_size, vocab_mask
         )
         if self._hostlen:   # SELFSPEC_HOSTLEN=1: verify() leaves seq_lens_sum stale (only the x0 += bs above)
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
@@ -771,12 +915,18 @@ class SelfSpecDiffusionWorker:
             can_run_cuda_graph=batch_result.can_run_cuda_graph,
         )
 
-    def _fast_commit_round(self, batch: ScheduleBatch, verify_input, batch_result) -> GenerationBatchResult:
+    def _fast_commit_round(self, batch: ScheduleBatch, verify_input, batch_result, plain: bool = True,
+                           vocab_mask: Optional[torch.Tensor] = None) -> GenerationBatchResult:
         """SELFSPEC_FAST_COMMIT=1: the full-draft round's verify + bookkeeping from ONE packed readback
         (speculative/selfspec_fast_commit.py). Same tokens, finish state, KV lengths, freed slots, seeds and counters as
-        verify_input.verify() + the tail of _fulldraft_verify; the scheduler gets the per-request host token lists."""
+        verify_input.verify() + the tail of _fulldraft_verify; the scheduler gets the per-request host token lists.
+        A plain batch (the greedy round) runs exactly the kernels it always ran; any other batch gets the AR-exact target
+        decision and its committed tokens fed to the penalizers (device ops, before the commit's readback)."""
         logits_output = batch_result.logits_output
-        verify_logits(verify_input, batch, logits_output, skip_custom=False)
+        verify_logits(verify_input, batch, logits_output, vocab_mask, plain=plain, cand_cpu=verify_input.ss_cand_cpu,
+                      in_block_start=0)
+        if not plain:
+            cumulate_committed(verify_input, batch)
         ahead = self._ahead_callback(batch) if self._draft_ahead and getattr(logits_output, "customized_info", None) is None else None
         e0 = self._fc.n_early
         out, toks, js = self._fc.commit(verify_input, batch, self._seeds(), ahead=ahead)
@@ -841,9 +991,10 @@ class SelfSpecDiffusionWorker:
             # the next iteration will try a prefill admission, which releases a stash first (wasted draft): do not launch one
             self._ahead_stats["skip_sched"] += 1
             return None
-        if batch.return_logprob or batch.return_hidden_states or batch.has_grammar or \
-                (batch.sampling_info is not None and batch.sampling_info.has_custom_logit_processor):
-            self._ahead_stats["skip_flags"] += 1   # custom logit processor (n-gram blocker): a0's ban needs the committed tokens
+        if batch.return_logprob or batch.return_hidden_states or not self._plain(batch):
+            # a non-plain batch draws a0 from host state that this round's bookkeeping updates after the ahead launch point (grammar,
+            # the custom processors' request view, the penalizers' cumulation): it runs the fast-commit round without the pre-launch
+            self._ahead_stats["skip_flags"] += 1
             return None
         return lambda inc: self._launch_ahead(batch, inc)
 
@@ -939,6 +1090,12 @@ class SelfSpecDiffusionWorker:
             nti = r.next_token_ids.view(-1)
             # write straight into the device-resident pool (no int() x bs D2H); only a readiness flag stays on the host.
             self._seeds()[batch.req_pool_indices] = nti.to(torch.int64)
+            orch = batch.sampling_info.penalizer_orchestrator if batch.sampling_info is not None else None
+            if orch is not None and orch.is_required:
+                # spec v1: ScheduleBatch.prepare_for_decode returns before cumulate_output_tokens, so the worker feeds every committed
+                # token to the penalizers itself; the prefill-sampled token is the first. (A chunked-prefill row's token is discarded
+                # and the row is filtered out of the batch before it is merged into the running batch.)
+                orch.cumulate_output_tokens(nti.to(torch.int64))
             for req in batch.reqs:
                 req._spec_seed_ready = True
             return GenerationBatchResult(
@@ -955,7 +1112,7 @@ class SelfSpecDiffusionWorker:
             # after its readback). Use it only for the batch it was built for; otherwise free its KV slots and draft afresh.
             st, self._stash = self._stash, None
             if st is not None:
-                if self._stash_matches(st, batch):
+                if self._stash_matches(st, batch) and self._plain(batch):
                     self._use_stash(st, batch)
                     return self._fulldraft_verify(batch, None)
                 self._discard_stash(st, "batch changed")
@@ -1006,8 +1163,13 @@ class SelfSpecDiffusionWorker:
 
         batch.spec_algorithm = SpeculativeAlgorithm.SELFSPEC_DIFFUSION
         batch.forward_mode = ForwardMode.TARGET_VERIFY
-        spec = NgramVerifyInput(draft_tokens, custom_mask, pos, ri, nt, ns, K)
+        spec = _LegacyVerifyInput(draft_tokens, custom_mask, pos, ri, nt, ns, K)
         spec.selfspec_causal = True if self._nomask else None   # VERIFY = causal block
+        plain = self._plain(batch)
+        spec.ss_plain = plain
+        draft_cpu = draft_tokens.view(bs, K).cpu() if (not plain and (batch.has_grammar or
+                                                                       batch.sampling_info.has_custom_logit_processor)) else None
+        spec.ss_cand_cpu = draft_cpu.tolist() if (draft_cpu is not None and batch.sampling_info.has_custom_logit_processor) else None
         if self._fastattn:
             spec.selfspec_role = "verify"
             if self._shadow:
@@ -1053,9 +1215,18 @@ class SelfSpecDiffusionWorker:
             for j in (0, 1, 2, 3):  # verify logit[j] predicts block[j+1]
                 t = torch.topk(vp[j], 3)
                 print(f"[SSVERIFY block[{j+1}]] top3={[(int(a),round(float(b),4)) for a,b in zip(t.indices,t.values)]}", flush=True)
-        verify_input: NgramVerifyInput = mwb.spec_info
+        verify_input: _LegacyVerifyInput = mwb.spec_info
+        vocab_mask = None
+        if batch.has_grammar:
+            # the chain root x0 is already in the grammar: the stock n-gram bitmask (row j = state after x0, d1..dj)
+            nxt, sib = chain_retrieve_cpu(K)
+            vocab_mask = generate_token_bitmask(batch.reqs, verify_input, nxt.expand(bs, K), sib.expand(bs, K), draft_cpu,
+                                                batch.sampling_info.vocab_size)
+            if vocab_mask is not None:
+                vocab_mask = verify_input.grammar.move_vocab_mask(vocab_mask, self.device)
+            batch.sampling_info.vocab_mask = None
         logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
-            batch, batch_result.logits_output, self.page_size, None
+            batch, batch_result.logits_output, self.page_size, vocab_mask
         )
         if self._hostlen:   # SELFSPEC_HOSTLEN=1: verify() leaves seq_lens_sum stale
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())

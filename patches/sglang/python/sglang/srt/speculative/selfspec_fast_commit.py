@@ -1,3 +1,6 @@
+# Portions Copyright 2023-2024 SGLang Team, licensed under the Apache License, Version 2.0 (the notice of SGLang's
+# LICENSE; sglang/srt/speculative/ngram_info.py has no per-file notice): the n-gram verify and accept bookkeeping
+# this module replaces is adapted from ngram_info.py (SGLang v0.5.10).
 """SELFSPEC_FAST_COMMIT=1: one packed readback per self-spec round, full-draft (SELFSPEC_FULLDRAFT=1) rounds only.
 
 The inherited n-gram verify bookkeeping (ngram_info.NgramVerifyInput.verify -> _fill_requests / _free_cache, and the worker's
@@ -19,6 +22,8 @@ points per round at bs = 1. Here:
   counts, and the rejected KV slots are freed with the device free list (or plain views of verify_loc when a request finished inside
   the round, in the old eviction order).
 
+The host rules (stop_set, is_fast, cut_index, cannot_finish, commit_fast, commit_slow, host_commit) live in the dependency-free
+selfspec_commit_rules (unit-tested on CPU against the per-token loop) and are re-exported here.
 Finish semantics (== the old per-token loop, checked by driving both on real Req objects):
   the old loop appends one token at a time and calls check_finished(1), whose order per position is to_finish, length
   (len(output_ids) >= max_new_tokens), grammar, stop token (unless ignore_eos), vocab boundary (id > vocab_size or < 0), stop strings.
@@ -42,6 +47,9 @@ Scheduler contract: GenerationBatchResult.next_token_ids_cpu (per-request host l
 output processor's next_token_ids.tolist(); finish_checked=True skips its redundant check_finished (the release block still runs).
 next_token_ids stays a device [bs] tensor (the next seeds): it becomes batch.output_ids, which filter_batch indexes on the device.
 Logits / hidden states are not compacted (FULLDRAFT=1 rejects return_logprob; a batch with return_hidden_states takes the old path).
+Verify-row logits (verify_logits): a batch that uses no sampling feature runs verify_tree_greedy on the raw logits (the greedy
+round); any other batch gets AR's processing per row (process_verify_logits) and AR's greedy rule or exact speculative sampling
+(sampling_verify), and its committed tokens are fed to the penalizers (cumulate_committed) right after the commit kernel.
 The pinned readback buffer is reused every round: safe in the spec-v1 loop because the host has finished reading it before the next round's
 copy is enqueued. This still holds with SELFSPEC_DRAFT_AHEAD=1: the rows are turned into host lists right after
 the event sync, and the next round's copy is enqueued only in the next worker call (after its verify), so no ping-pong buffer is needed.
@@ -49,20 +57,47 @@ the event sync, and the next round's copy is enqueued only in the next worker ca
 SELFSPEC_CHECK=1 (syncs; diagnostic only): per round, the accepted-index rows must be the linear chain (i*K + 0..acc, then -1), and
 after the commit the device seq_lens / seed pool / free list must equal what the host derived, and kv_committed_len == seq_lens_cpu.
 """
-import copy
 import logging
 import os
-from typing import List
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative import selfspec_commit_rules
+from sglang.srt.speculative.selfspec_commit_rules import (  # noqa: F401  (re-exported: the host commit rules live there)
+    cannot_finish,
+    commit_fast,
+    commit_slow,
+    cut_index,
+    grammar_accept_or_abort,
+    host_commit,
+    is_fast,
+    stop_set,
+)
+from sglang.srt.speculative.selfspec_sampling import (
+    acceptance_coins,
+    apply_custom_rows,
+    cumulate_block,
+    penalize_rows,
+    verify_target_probs,
+)
 from sglang.srt.speculative.spec_utils import TREE_SPEC_KERNEL_AVAILABLE
+from sglang.srt.utils import is_cuda
+
+if is_cuda():
+    from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob, tree_speculative_sampling_target_only
+else:  # sampling verify needs the CUDA kernels; verify_logits falls back to greedy as upstream n-gram does
+    top_k_renorm_prob = top_p_renorm_prob = tree_speculative_sampling_target_only = None
 
 logger = logging.getLogger(__name__)
+
+# A grammar rejection of a committed token aborts that request, as SGLang's AR output processor does (never the scheduler).
+selfspec_commit_rules.set_abort_reason_factory(lambda msg: FINISH_ABORT(message=msg))
 
 
 def fast_commit_enabled() -> bool:
@@ -111,158 +146,100 @@ def _ss_commit_kernel(
     tl.store(free_ptr + prev + (j - a - 1), src, mask=rej)
 
 
-def stop_set(req) -> frozenset:
-    """the ids _check_token_based_finish matches (empty with ignore_eos); cached on the request (its sampling params, eos ids and
-    tokenizer do not change after it is created)."""
-    s = getattr(req, "_ss_stop", None)
-    if s is None:
-        sp = req.sampling_params
-        ids = set()
-        if not sp.ignore_eos:
-            if sp.stop_token_ids:
-                ids |= set(sp.stop_token_ids)
-            if req.eos_token_ids:
-                ids |= set(req.eos_token_ids)
-            tk = req.tokenizer
-            if tk is not None:
-                if tk.eos_token_id is not None:
-                    ids.add(tk.eos_token_id)
-                extra = getattr(tk, "additional_stop_token_ids", None)
-                if extra:
-                    ids |= set(extra)
-        s = frozenset(ids)
-        req._ss_stop = s
-    return s
+def verify_logits(vi, batch, logits_output, vocab_mask=None, plain=True, cand_cpu=None, in_block_start=0):
+    """Target decision for every verify row of a self-spec round; leaves vi.predict / vi.accepted_indices / vi.accept_length on the
+    device for the commit.
 
-
-def is_fast(req) -> bool:
-    """requests whose finish check reduces to length / stop-token / vocab-boundary (see module docstring)."""
-    sp = req.sampling_params
-    return (
-        req.grammar is None
-        and not req.to_finish
-        and not req.finished()
-        and not sp.stop_strs
-        and not sp.stop_regex_strs
-        and req.vocab_size is not None
-    )
-
-
-def cut_index(T: List[int], budget: int, stop: frozenset, vocab: int) -> int:
-    """index of the last token the per-token loop would append: min(budget - 1, first stop id, first out-of-vocab id, len(T) - 1)."""
-    lim = len(T) - 1
-    if budget - 1 < lim:
-        lim = budget - 1 if budget > 0 else 0
-    for t in range(lim):
-        x = T[t]
-        if x in stop or x > vocab or x < 0:
-            return t
-    return lim
-
-
-def cannot_finish(req, T: List[int]) -> bool:
-    """SELFSPEC_DRAFT_AHEAD=1 host-only finish pre-check: True iff host_commit(req, T) appends ALL of T
-    and leaves the request unfinished. Exact for fast requests (== commit_fast's cut rule, which fires on length, stop id or vocab
-    boundary: none can fire when budget > len(T), no id of T is in the stop set and every id is in [0, vocab]); always False for slow
-    requests (grammar, stop strings / regexes, to_finish), whose finish depends on more than the ids."""
-    if not is_fast(req):
-        return False
-    if req.sampling_params.max_new_tokens - len(req.output_ids) <= len(T):
-        return False
-    s = stop_set(req)
-    if s and not s.isdisjoint(T):
-        return False
-    return min(T) >= 0 and max(T) <= req.vocab_size
-
-
-def commit_fast(req, T: List[int]) -> int:
-    """fast request: one extend + one check_finished. Returns j (T[:j + 1] appended)."""
-    j = cut_index(T, req.sampling_params.max_new_tokens - len(req.output_ids), stop_set(req), req.vocab_size)
-    req.output_ids.extend(T[: j + 1])
-    req.check_finished(j + 1)
-    return j
-
-
-def commit_slow(req, T: List[int]):
-    """the old per-token loop (worker _FullDraftVerifyInput._fill_requests) over the host row, no GPU access.
-    Returns (j, a0_finished)."""
-    req.output_ids.append(T[0])
-    req.check_finished()
-    if req.finished():
-        return 0, True
-    if req.grammar is not None:
-        try:
-            req.grammar.accept_token(T[0])
-        except ValueError as e:
-            logger.info(f"{req=} a0={T[0]}")
-            raise e
-    for t in range(1, len(T)):
-        req.output_ids.append(T[t])
-        req.check_finished()
-        if req.finished():
-            return t, False
-        if req.grammar is not None:
-            try:
-                req.grammar.accept_token(T[t])
-            except ValueError as e:
-                logger.info(f"{req=} token={T[t]} committed={T}")
-                raise e
-    if req.grammar is not None and not req.finished():
-        req.check_finished()   # the old path's scheduler re-check: a grammar may terminate on the last accepted token
-    return len(T) - 1, False
-
-
-def host_commit(reqs, rows) -> tuple:
-    """host part of the commit for FULLDRAFT=1 rows (a0, acc, predict row). Mutates the requests exactly as the old per-token loop
-    (tokens, finish state, grammar, spec counters). Returns (tokens per request, j per request, acc per request)."""
-    toks, js, accs = [], [], []
-    for req, r in zip(reqs, rows):
-        a = r[1]
-        T = [r[0]] + r[2 : 3 + a]
-        if is_fast(req):
-            j = commit_fast(req, T)
-            a0_fin = j == 0 and req.finished()
-        else:
-            j, a0_fin = commit_slow(req, T)
-        # counters, the old convention (worker _fill_requests): the untruncated verified count, 0 if a0 finished the request
-        req.spec_verify_ct += 1
-        adt = 0 if a0_fin else a + 1
-        req.spec_accepted_tokens += adt
-        req.update_spec_acceptance_histogram(adt)
-        toks.append(T[: j + 1])
-        js.append(j)
-        accs.append(a)
-    return toks, js, accs
-
-
-def verify_logits(vi, batch, logits_output, vocab_mask=None, skip_custom=False):
-    """the part of NgramVerifyInput.verify (ngram_info.py:446-510) before its _fill_requests, verbatim: sampling-info filter, custom
-    logit processors, the relaxed penalties (+ SELFSPEC_EXACT_PENALTY), grammar vocab mask, then greedy (verify_tree_greedy) or tree
-    sampling verify. Leaves vi.predict / vi.accepted_indices / vi.accept_length on the device for the commit."""
-    bs = vi.retrive_index.shape[0]
-    sampling_info = batch.sampling_info
-    if bs != len(sampling_info):
-        sampling_info = copy.deepcopy(sampling_info)
-        sampling_info.filter_batch(vi.retrive_index.tolist(), vi.retrive_index)
-    # skip_custom: the caller already applied its custom logit processors to every verify row
-    if sampling_info.has_custom_logit_processor and not skip_custom:
-        apply_custom_logit_processor(logits_output.next_token_logits, sampling_info, num_tokens_in_batch=vi.draft_token_num)
-    if sampling_info.penalizer_orchestrator.is_required or sampling_info.logit_bias is not None:
-        sampling_info.penalizer_orchestrator.apply(logits_output.next_token_logits, repeat=vi.draft_token_num)
-        if sampling_info.logit_bias is not None:
-            logits_output.next_token_logits.add_(torch.repeat_interleave(sampling_info.logit_bias, vi.draft_token_num, dim=0))
-        if os.environ.get("SELFSPEC_EXACT_PENALTY", "0") == "1":
-            vi._exact_block_repetition_penalty(sampling_info, logits_output, bs)
-    if vocab_mask is not None:
-        assert vi.grammar is not None
-        vi.grammar.apply_vocab_mask(logits=logits_output.next_token_logits, vocab_mask=vocab_mask)
-    is_all_greedy = sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
+    plain=True (selfspec_sampling.is_plain: every request greedy, no penalties / logit_bias / custom processor / grammar): greedy
+    verify (verify_tree_greedy) on the raw logits -- exactly the kernels of the greedy round, nothing added.
+    Otherwise process_verify_logits gives each row the logits processing AR decode gives the same prefix, then greedy verify
+    (argmax, AR's greedy rule) or sampling_verify (speculative sampling against AR's target distribution)."""
+    if plain:
+        vi._greedy_verify(batch, logits_output)
+        return
+    si = process_verify_logits(vi, batch, logits_output, vocab_mask, cand_cpu, in_block_start)
+    is_all_greedy = si.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
     if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
         logger.warning("Tree speculative sampling kernel unavailable (likely AMD/HIP build). Falling back to greedy verification.")
     if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
         vi._greedy_verify(batch, logits_output)
     else:
-        vi._sampling_verify(batch, logits_output, sampling_info)
+        sampling_verify(vi, batch, logits_output, si)
+
+
+def process_verify_logits(vi, batch, logits_output, vocab_mask=None, cand_cpu=None, in_block_start=0):
+    """AR decode's logits processing for every verify row, in AR order (model_runner._preprocess_logits, then the sampler's custom
+    logit processors). Row j of request i predicts the token after cand[i, j] (cand = vi.draft_token.view(bs, K)); its prefix holds
+    the committed tokens and cand[i, 0..j]:
+      penalties: orchestrator state (every committed token; a0 already cumulated in the full-draft round) + cand[i, 1..j], each
+                 penalizer in orchestrator order with its own op (selfspec_sampling.penalize_rows);
+      grammar:   vocab_mask row = the grammar state after cand[i, 0..j] (built by the worker; the a0 / x0 root included);
+      logit_bias, then custom logit processors with a request view whose output_ids hold the same prefix
+      (cand_cpu = host copy of cand; in_block_start = 0 in the full-draft round, 1 in the legacy round, see apply_custom_rows).
+    In place on logits_output.next_token_logits; returns the batch's SamplingBatchInfo."""
+    bs, K = vi.retrive_index.shape[0], vi.draft_token_num
+    si = batch.sampling_info
+    assert len(si) == bs, (len(si), bs)
+    logits = logits_output.next_token_logits
+    cand = vi.draft_token.view(bs, K)
+    penalize_rows(si.penalizer_orchestrator, logits, cand, apply_scaling_penalties)
+    if vocab_mask is not None:
+        assert vi.grammar is not None
+        vi.grammar.apply_vocab_mask(logits=logits, vocab_mask=vocab_mask)
+    if si.logit_bias is not None:
+        logits.add_(torch.repeat_interleave(si.logit_bias, K, dim=0))
+    if si.has_custom_logit_processor:
+        apply_custom_rows(logits, si, cand_cpu if cand_cpu is not None else cand.tolist(), in_block_start)
+    return si
+
+
+def sampling_verify(vi, batch, logits_output, si):
+    """Speculative sampling of a deterministic draft chain against AR's distribution (replaces NgramVerifyInput._sampling_verify,
+    whose target ignores min_p and applies top-k then top-p on the renormalized top-k probabilities, unlike AR's sampler).
+    Per request: draft token d_j is accepted with probability p_j(d_j) (p_j = verify_target_probs, AR's sampling distribution for
+    row j); at the first rejection the token is drawn from p_j with d_j removed and renormalized; when every draft is accepted the
+    bonus is drawn from the last row. That is exactly a sample of AR decoding (standard speculative sampling with a point-mass draft).
+    Acceptance thresholds are 1.0 (exact; the worker refuses other values at start-up); coins are in (0, 1], so a token with target
+    probability 0 is never accepted."""
+    bs, K = batch.batch_size(), vi.draft_token_num
+    dev = vi.device
+    candidates = vi.draft_token.reshape(bs, K)
+    vi.predict = torch.empty((bs * K + 1,), dtype=torch.int32, device=dev)
+    vi.accepted_indices = torch.full((bs, K), -1, dtype=torch.int32, device=dev)
+    vi.accept_length = torch.empty((bs,), dtype=torch.int32, device=dev)
+    target_probs = verify_target_probs(
+        logits_output.next_token_logits, si, K, get_global_server_args().sampling_backend,
+        top_k_renorm_prob, top_p_renorm_prob,
+    ).reshape(bs, K, -1)
+    tree_speculative_sampling_target_only(
+        predicts=vi.predict,
+        accept_index=vi.accepted_indices,
+        accept_token_num=vi.accept_length,
+        candidates=candidates.to(torch.int64),
+        retrive_index=vi.retrive_index.to(torch.int64),
+        retrive_next_token=vi.retrive_next_token.to(torch.int64),
+        retrive_next_sibling=vi.retrive_next_sibling.to(torch.int64),
+        uniform_samples=acceptance_coins((bs, K), dev),
+        uniform_samples_for_final_sampling=torch.rand((bs,), dtype=torch.float32, device=dev),
+        target_probs=target_probs,
+        draft_probs=torch.zeros_like(target_probs),
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        deterministic=True,
+    )
+
+
+def cumulate_committed(vi, batch) -> None:
+    """Penalizer cumulation of the verify tokens this round commits: predict[i * K + 0..acc] (accepted draft tokens + the bonus) per
+    request, from the untruncated accept length. A request that finishes inside the round gets its later tokens cumulated too; it
+    leaves the batch before the next forward, so its rows are never read again. Device ops only."""
+    orch = batch.sampling_info.penalizer_orchestrator
+    if orch is None or not orch.is_required:
+        return
+    bs, K = batch.batch_size(), vi.draft_token_num
+    tok = vi.predict[: bs * K].view(bs, K)
+    valid = torch.arange(K, device=tok.device).view(1, K) <= vi.accept_length.view(bs, 1).to(torch.int64)
+    cumulate_block(orch, tok, valid)
 
 
 class SelfSpecFastCommit:

@@ -44,10 +44,10 @@ uv sync                          # inference env (pyproject.toml, torch 2.9.1+cu
 ## 2. Serve (SGLang, self-speculative)
 
 ```bash
-# SGLang v0.5.12 + our patch
+# SGLang v0.5.10 + our patch
 git clone https://github.com/sgl-project/sglang $SGLANG_SRC && cd $SGLANG_SRC
-git checkout $(cut -c1-40 $DOCR_ROOT/patches/sglang/sglang_BASE_COMMIT.txt)          # v0.5.12 base commit
-git apply $DOCR_ROOT/patches/sglang/sglang_0.5.12_selfspec.patch
+git checkout $(cut -c1-40 $DOCR_ROOT/patches/sglang/sglang_BASE_COMMIT.txt)          # v0.5.10 base commit
+git apply $DOCR_ROOT/patches/sglang/sglang_0.5.10_selfspec.patch
 cp -r $DOCR_ROOT/patches/sglang/python .                                            # the new files
 # torchao / torchaudio / torchvision / torchcodec in the freeze are +cu129 builds: they come from the PyTorch index
 uv venv .venv-sglang --python 3.12 && uv pip install --python .venv-sglang/bin/python -r $DOCR_ROOT/env/sglang_venv_freeze.txt -e $SGLANG_SRC/python \
@@ -57,7 +57,7 @@ uv venv .venv-sglang --python 3.12 && uv pip install --python .venv-sglang/bin/p
 bash serve/serve_sglang_ocr.sh MODE=spec GPU=0 PORT=30500 CKPT=<path or trillionlabs/GravityOCR> CONTEXT=16384 VBIN=$PWD/.venv-sglang/bin
 curl localhost:30500/v1/models          # OpenAI-compatible
 ```
-Details, multi-GPU (`DP=8`), and the parity check (spec output ≡ AR output) are in `serve/SGLANG_SERVE.md`;
+Details, multi-GPU (`DP=8`), the parity check (spec vs AR token ids) and the request options spec mode serves are in `serve/SGLANG_SERVE.md`;
 the implementation walkthrough is `docs/SGLANG_SELFSPEC_IMPL.md`. Concurrent-request throughput against
 any OpenAI-compatible endpoint (ours, vLLM, …) with one identical client: `tools/http_ocr_throughput.py`.
 

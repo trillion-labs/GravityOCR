@@ -1,1 +1,1 @@
-1519acf37c23f2189adb93f57ca9cd2db1bebf18  upstream sgl-project/sglang v0.5.12 — apply sglang_0.5.12_selfspec.patch here, then cp -r python .
+1519acf37c23f2189adb93f57ca9cd2db1bebf18  upstream sgl-project/sglang v0.5.10 — apply sglang_0.5.10_selfspec.patch here, then cp -r python .

@@ -83,7 +83,7 @@ GLM-OCR SDK. Fine-tuning was predominantly English; Chinese works at the base mo
 
 Needs the [code repository](https://github.com/trillion-labs/GravityOCR); same weights, same output, ~9.7 tokens per forward pass.
 
-- **Serve:** SGLang v0.5.12 + `patches/sglang/`, then `bash serve/serve_sglang_ocr.sh MODE=spec CKPT=trillionlabs/GravityOCR` — an OpenAI-compatible endpoint (`MODE=ar` serves the same checkpoint autoregressively for a direct comparison).
+- **Serve:** SGLang v0.5.10 + `patches/sglang/`, then `bash serve/serve_sglang_ocr.sh MODE=spec CKPT=trillionlabs/GravityOCR` — an OpenAI-compatible endpoint (`MODE=ar` serves the same checkpoint autoregressively for a direct comparison).
 - **In process:** `python src/infer_omnidocbench.py --checkpoint trillionlabs/GravityOCR --spec_natcache ...`
 
 Both are written out step by step in the repository's [`AGENTS.md`](https://github.com/trillion-labs/GravityOCR/blob/main/AGENTS.md).

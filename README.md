@@ -70,7 +70,7 @@ Both are written out in [`AGENTS.md`](AGENTS.md).
 
 - **Weights:** [`trillionlabs/GravityOCR`](https://huggingface.co/trillionlabs/GravityOCR) — a standard
   `GlmOcrForConditionalGeneration` checkpoint plus `block_diffusion.json` (`bd_size`, `mask_id`, `ar_loss_weight`).
-- **Serving patch:** `patches/sglang/` on SGLang v0.5.12.
+- **Serving patch:** `patches/sglang/` on SGLang v0.5.10.
 - **Docs:** `docs/00_INDEX.md`.
 
 ## Citation
