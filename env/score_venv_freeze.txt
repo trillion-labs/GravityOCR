@@ -40,7 +40,7 @@ numpy==1.24.4
 # OmniDocBench scorer: editable install of the official repo (see docs/04_EVAL.md)
 packaging==26.2
 pandas==2.0.3
-pillow==10.4.0
+pillow==13.0.0
 propcache==0.5.2
 pyarrow==24.0.0
 pygments==2.20.0
