@@ -264,6 +264,41 @@ def _check_sampling_support(server_args: ServerArgs):
         )
 
 
+def _host_list(x):
+    return x.tolist() if hasattr(x, "tolist") else list(x)
+
+
+def fulldraft_output_logprobs(batch: ScheduleBatch, a0: torch.Tensor, a0_lo, verify_input, logits_output, n_verified: int):
+    """Output log probabilities of one full-draft round, per request in commit order: a0's entry, then one entry per verified token.
+
+    a0's entry comes from SGLang's sampler (Sampler.forward with return_logprob on the draft's causal row 0; a0_lo is that
+    LogitsProcessorOutput): the value AR decode records for the same token. The verified tokens' entries come from the verify logits
+    after this round's processing (in-block penalties, grammar mask, logit_bias and custom processors for a batch that uses them;
+    sliced to the accepted rows by _fill_requests) through upstream add_output_logprobs_for_spec_v1, as SGLang's n-gram / EAGLE spec v1
+    workers record theirs. A request whose a0 ends it has no verified token (accept_length -1): a0's entry only. Lists are per request,
+    so appending every a0 first and the verify rows after keeps each request's order. n_verified == 0 (every request ended at a0)
+    skips the upstream call, whose top-k path cannot take an empty batch."""
+    from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
+
+    a0_ids = a0.tolist()
+    lp = a0_lo.next_token_logprobs.tolist()
+    tv, ti = a0_lo.next_token_top_logprobs_val, a0_lo.next_token_top_logprobs_idx
+    iv, ii = a0_lo.next_token_token_ids_logprobs_val, a0_lo.next_token_token_ids_logprobs_idx
+    for i, req in enumerate(batch.reqs):
+        if not req.return_logprob:
+            continue
+        req.output_token_logprobs_val.append(lp[i])
+        req.output_token_logprobs_idx.append(a0_ids[i])
+        if req.top_logprobs_num > 0:
+            req.output_top_logprobs_val.append(_host_list(tv[i]))
+            req.output_top_logprobs_idx.append(_host_list(ti[i]))
+        if req.token_ids_logprob is not None:
+            req.output_token_ids_logprobs_val.append(_host_list(iv[i]))
+            req.output_token_ids_logprobs_idx.append(_host_list(ii[i]))
+    if n_verified > 0:
+        add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
+
+
 class SelfSpecDiffusionWorker:
     def __init__(
         self,
@@ -300,7 +335,6 @@ class SelfSpecDiffusionWorker:
         # int(last[i]) x bs at the end of verify (D2H). The value only ever needs to flow on the GPU.
         # Indexed by req_pool_idx, an identifier that stays with the request as the batch composition
         # changes under continuous batching, so the batch-safety of a per-request carry is preserved.
-        self._nomask = os.environ.get("SELFSPEC_NOMASK", "0") == "1"   # default OFF: worse on both correctness and speed
         self._seed_pool = None
         self._seed_pool_dev = self.device
         # SELFSPEC_FULLDRAFT=1 (default): the full-draft round -- all K-1 mask logits are candidates and a0 is
@@ -325,8 +359,6 @@ class SelfSpecDiffusionWorker:
         # row 0 (seed: prefix + seed only) is copied into row 0. See speculative/selfspec_fast_attn.py.
         # Default OFF = the custom-mask path, unchanged.
         self._fastattn = os.environ.get("SELFSPEC_FASTATTN", "0") == "1"
-        if self._fastattn and self._nomask:
-            raise ValueError("SELFSPEC_FASTATTN=1 and SELFSPEC_NOMASK=1 are mutually exclusive")
         if self._fastattn and getattr(self.model_runner.attn_backend, "ss_planner", None) is None:
             # one source of truth: the worker drops the masks only if the backend (and so the graph runner, which keys its
             # graphs on the same planner) really runs the fast path; otherwise a mask-less forward would hit a mask wrapper
@@ -359,12 +391,6 @@ class SelfSpecDiffusionWorker:
         self._e_mask = _e("SELFSPEC_MASK", "1") == "1"
         self._e_nosync = _e("SELFSPEC_NOSYNC", "0") == "1"
         self._e_verify_dump = _e("SELFSPEC_VERIFY_DUMP", "0") == "1"
-        # NOMASK makes the whole draft non-causal, and with FULLDRAFT=1 the draft's
-        # seed row is committed (a0 unconditionally, x0's K/V reused), so the committed tokens would come from a non-causal row:
-        # not lossless. Refused on both attention paths.
-        if self._nomask and self._fulldraft:
-            raise ValueError("SELFSPEC_NOMASK=1 with SELFSPEC_FULLDRAFT=1 is not lossless (the committed seed row / a0 would be "
-                             "computed non-causally); use SELFSPEC_FASTATTN=1 for a mask-free path, or SELFSPEC_FULLDRAFT=0")
         # SELFSPEC_SHADOW=1 (with SELFSPEC_FASTATTN=1; diagnostic, eager forwards only, syncs): also build the OLD custom
         # masks (exactly as the flag-off branches below) and hand them to the backend on spec_info.ss_shadow_mask, which plans the
         # old custom-mask wrapper with them and compares every attention call bitwise (speculative/selfspec_fast_attn.py).
@@ -392,6 +418,7 @@ class SelfSpecDiffusionWorker:
         # DEV_POS full-draft verify ids come straight from the draft argmax; the debug consumers of the assembled `draft` tensor keep it
         self._dev_ids = self._dev_pos and self._fulldraft and not (self._e_accept_stats or self._e_draft_dump)
         self._pos_consts = {}
+        self._a0_lo = None   # a0's sampler output with log probabilities (batch.return_logprob), consumed by _fulldraft_verify
         self._fc = (SelfSpecFastCommit(self.draft_token_num, int(self.model_runner.req_to_token_pool.size), self.device, self._check)
                     if self._fast_commit else None)
         self._am = None
@@ -458,9 +485,11 @@ class SelfSpecDiffusionWorker:
 
     @staticmethod
     def _plain(batch: ScheduleBatch) -> bool:
-        """selfspec_sampling.is_plain: every request greedy, no penalties / logit_bias / custom processor / grammar. Host attributes
-        only. A plain batch runs the greedy round unchanged (a0 = the draft argmax, verify on the raw logits, no cumulation)."""
-        return is_plain(batch.sampling_info, batch.has_grammar)
+        """selfspec_sampling.is_plain and no log probabilities: every request greedy, no penalties / logit_bias / custom processor /
+        grammar, no return_logprob. Host attributes only. A plain batch runs the greedy round unchanged (a0 = the draft argmax,
+        verify on the raw logits, no cumulation, fast commit / draft-ahead as configured). Any other batch draws a0 with SGLang's
+        sampler (_sample_a0), which also computes a0's log probability when the batch asks for them."""
+        return is_plain(batch.sampling_info, batch.has_grammar) and not batch.return_logprob
 
     def _sample_a0(self, batch: ScheduleBatch, logits: torch.Tensor) -> torch.Tensor:
         """Non-plain batch: a0 = SGLang's own sampler on the draft's causal row 0 (the AR logits of the token after the seed x0),
@@ -470,11 +499,17 @@ class SelfSpecDiffusionWorker:
         --enable-deterministic-inference's per-request seeds read). a0 is then fed to the penalizers, one token per request, as AR
         feeds every sampled token. si.grammars was set by get_model_worker_batch() before the draft forward.
         (The verify rows' speculative sampling draws its coins from the device RNG, as SGLang's EAGLE / n-gram verify does: the
-        committed tokens follow AR's distribution, but per-request sampling seeds do not reproduce them token for token.)"""
+        committed tokens follow AR's distribution, but per-request sampling seeds do not reproduce them token for token.)
+        With batch.return_logprob the sampler also computes a0's log probability, top-k and token-id log probabilities exactly as
+        AR decode does for the same token (its temperature handling and SGLANG_RETURN_ORIGINAL_LOGPROB included); they are kept on
+        self._a0_lo for _fulldraft_verify, which records them before the verify rows' (fulldraft_output_logprobs)."""
         si = batch.sampling_info
         lo = LogitsProcessorOutput(next_token_logits=logits[:, 0].float().clone())   # a copy: the draft logits may be a graph buffer
         self.model_runner._preprocess_logits(lo, si)
-        a0 = self.model_runner.sampler(lo, si, False, None, None, batch.seq_lens).to(torch.int64)
+        rl = bool(batch.return_logprob)
+        a0 = self.model_runner.sampler(lo, si, rl, batch.top_logprobs_nums if rl else None,
+                                       batch.token_ids_logprobs if rl else None, batch.seq_lens).to(torch.int64)
+        self._a0_lo = lo if rl else None
         orch = si.penalizer_orchestrator
         if orch is not None and orch.is_required:
             orch.cumulate_output_tokens(a0)
@@ -651,12 +686,6 @@ class SelfSpecDiffusionWorker:
                 within = torch.ones((n, n), device=dev, dtype=torch.bool)
                 within[0, 1:] = 0
                 shadow_mask = self._full_mask(batch, within)
-        elif self._nomask:
-            # Mask-free: the bidirectional block equals the kernel's built-in NON_CAUSAL. Only row 0 (the seed)
-            # differs from the old mask (the seed now sees the masks after it); correctness rests on VERIFY
-            # (AR greedy + exact-match accept), not on the draft, so output still equals AR. A changed draft
-            # quality only moves acceptance (= speed); check tok/fwd.
-            mask = None
         else:
             within = torch.ones((n, n), device=dev, dtype=torch.bool)
             within[0, 1:] = 0  # block[0]=seed causal (AR); the K masks bidir
@@ -664,7 +693,6 @@ class SelfSpecDiffusionWorker:
         ri, nt, ns = self._chain_retrieve(bs, n)
         pos = self._positions(batch, n)
         spec = NgramVerifyInput(draft_window, mask, pos, ri, nt, ns, n)
-        spec.selfspec_causal = False if self._nomask else None   # DRAFT = bidirectional block
         if self._fastattn:
             spec.selfspec_role = "draft"
             if shadow_mask is not None:
@@ -794,15 +822,18 @@ class SelfSpecDiffusionWorker:
           seq_lens: +1 before verify (x0 committed) -> the mask prefix / kv_indices include the x0 slot.
           accounting: a0 is spliced in front of each request's returned tokens; accept_length_per_req_cpu / num_accepted /
                    accept_lens get +1; spec_verify_ct stays 1 per round. a0-EOS is handled in `_FullDraftVerifyInput`.
+          log probabilities (batch.return_logprob): such a batch is not plain, so a0 was drawn by the sampler with its log
+                   probabilities (_sample_a0); it takes the per-token commit below (not SELFSPEC_FAST_COMMIT's single readback, like
+                   return_hidden_states), and fulldraft_output_logprobs records, per request, a0's entry first and then one entry per
+                   verified token from the processed verify logits (add_output_logprobs_for_spec_v1, as SGLang's n-gram / EAGLE spec v1
+                   workers do); a request that ends at a0 gets a0's entry only.
         """
         bs = batch.batch_size()
         K = self.draft_token_num
         dev = self.device
-        if batch.return_logprob:
-            raise NotImplementedError(
-                "SELFSPEC_FULLDRAFT=1 does not support return_logprob (a0's logit row lives in the "
-                "draft forward; splice not implemented — serving/bench do not use logprobs)"
-            )
+        a0_lo, self._a0_lo = self._a0_lo, None
+        if batch.return_logprob and a0_lo is None:
+            raise RuntimeError("[selfspec] a batch with return_logprob reached the full-draft verify without a0's log probabilities")
         if draft_tokens is None:
             # SELFSPEC_DEV_POS=1: [a0, d1..d_{K-1}] == the draft argmax [bs, K] (see _draft_block); no cat
             am, self._am = self._am, None
@@ -820,7 +851,7 @@ class SelfSpecDiffusionWorker:
         ri, nt, ns = self._chain_retrieve(bs, K)
         pos = self._positions(batch, K, extra=1)              # p0+1 .. p0+K (draft window positions +1)
         shadow_mask = None
-        if self._nomask or self._fastattn:
+        if self._fastattn:
             custom_mask = None   # fastattn: verify pattern = backend role "verify" (flashinfer CAUSAL)
             if self._shadow:   # the old verify mask, built exactly as the else-branch below
                 shadow_mask = self._full_mask(batch, torch.tril(torch.ones((K, K), device=dev, dtype=torch.bool)), extra=1)
@@ -846,7 +877,6 @@ class SelfSpecDiffusionWorker:
         spec.a0 = a0
         spec.ss_plain = plain
         spec.ss_cand_cpu = vt_cpu.tolist() if (vt_cpu is not None and si.has_custom_logit_processor) else None
-        spec.selfspec_causal = True if self._nomask else None
         if self._fastattn:
             spec.selfspec_role = "verify"
             if shadow_mask is not None:
@@ -866,7 +896,7 @@ class SelfSpecDiffusionWorker:
                 verify_input.grammar = grammar
                 vocab_mask = grammar.move_vocab_mask(mask, dev)
             si.vocab_mask = None   # never let a stale mask from an earlier forward be reused
-        if self._fast_commit and not batch.return_hidden_states:
+        if self._fast_commit and not batch.return_hidden_states and not batch.return_logprob:
             return self._fast_commit_round(batch, verify_input, batch_result, plain, vocab_mask)
         logits_output, vid, _ = verify_input.verify(
             batch, batch_result.logits_output, self.page_size, vocab_mask
@@ -896,6 +926,9 @@ class SelfSpecDiffusionWorker:
             [sum(c + 1 for c in counts[: i + 1]) - 1 for i in range(bs)], device=dev, dtype=torch.int64
         )
         self._seeds()[batch.req_pool_indices] = out[ends].to(torch.int64)
+        if batch.return_logprob:
+            # spec v1: the output processor leaves log probabilities to the worker (same contract as EAGLE / n-gram)
+            fulldraft_output_logprobs(batch, a0, a0_lo, verify_input, logits_output, sum(counts))
 
         accept_length_per_req_cpu = counts                    # = committed - 1 (SGLang convention: the scheduler slices with +1)
         num_accepted_tokens = sum(counts)                     # the scheduler adds bs -> tokens committed this round
@@ -1145,9 +1178,8 @@ class SelfSpecDiffusionWorker:
         #      overflowed the cuda graph's fixed custom_mask buffer, killed the server with an illegal
         #      memory access in init_forward_metadata_replay_cuda_graph.
         # The no-mask path alone is wrong because the cuda graph is captured "with mask" and reads a stale
-        # buffer; with SELFSPEC_NOMASK the capture also uses tree_mask=None (cuda_graph_runner) so both
-        # sides agree; still experimental.
-        if self._nomask or self._fastattn:
+        # buffer; SELFSPEC_FASTATTN=1 is the mask-free path whose graphs are captured without a mask (cuda_graph_runner).
+        if self._fastattn:
             # The VERIFY mask (all-ones prefix ++ tril(K,K)) is element-wise identical to flashinfer's
             # bottom-right aligned CAUSAL (verified), so no mask is built and only causal=True is passed.
             custom_mask = None
@@ -1164,7 +1196,6 @@ class SelfSpecDiffusionWorker:
         batch.spec_algorithm = SpeculativeAlgorithm.SELFSPEC_DIFFUSION
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         spec = _LegacyVerifyInput(draft_tokens, custom_mask, pos, ri, nt, ns, K)
-        spec.selfspec_causal = True if self._nomask else None   # VERIFY = causal block
         plain = self._plain(batch)
         spec.ss_plain = plain
         draft_cpu = draft_tokens.view(bs, K).cpu() if (not plain and (batch.has_grammar or
@@ -1279,10 +1310,9 @@ class SelfSpecDiffusionWorker:
                 flush=True,
             )
         self._round_hist_update([a + 1 for a in accept_length_per_req_cpu])
-        # spec-v1 logprobs (RL only): on spec v1 the output processor leaves logprobs to the worker (same
-        # contract as EAGLE), so they are filled here. verify() has already sliced next_token_logits to
-        # the accepted rows, which this relies on. Serving does not request return_logprob, so this
-        # block does not run there.
+        # spec-v1 logprobs: on spec v1 the output processor leaves logprobs to the worker (same contract as EAGLE), so they
+        # are filled here. verify() has already sliced next_token_logits to the accepted rows, which this relies on. (The
+        # legacy round commits only verify-row tokens: x0 was recorded when the previous round committed it.)
         if batch.return_logprob:
             from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 

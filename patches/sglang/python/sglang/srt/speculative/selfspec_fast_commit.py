@@ -46,7 +46,8 @@ positions S..S+K-1, the worker wrote S+K).
 Scheduler contract: GenerationBatchResult.next_token_ids_cpu (per-request host lists = the tokens appended this round) replaces the
 output processor's next_token_ids.tolist(); finish_checked=True skips its redundant check_finished (the release block still runs).
 next_token_ids stays a device [bs] tensor (the next seeds): it becomes batch.output_ids, which filter_batch indexes on the device.
-Logits / hidden states are not compacted (FULLDRAFT=1 rejects return_logprob; a batch with return_hidden_states takes the old path).
+Logits / hidden states are not compacted: a batch with return_logprob or return_hidden_states takes the worker's per-token
+commit path (_fulldraft_verify), which records the log probabilities.
 Verify-row logits (verify_logits): a batch that uses no sampling feature runs verify_tree_greedy on the raw logits (the greedy
 round); any other batch gets AR's processing per row (process_verify_logits) and AR's greedy rule or exact speculative sampling
 (sampling_verify), and its committed tokens are fed to the penalizers (cumulate_committed) right after the commit kernel.

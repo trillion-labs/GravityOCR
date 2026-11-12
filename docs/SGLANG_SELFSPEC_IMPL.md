@@ -8,7 +8,7 @@ Shipped artifacts — `patches/sglang/`
 | file | content |
 |---|---|
 | `sglang_BASE_COMMIT.txt` | upstream SGLang commit the patch applies to (`1519acf`, tag v0.5.10) |
-| `sglang_0.5.10_selfspec.patch` | changes to 21 existing source files plus `python/pyproject.toml` — `git apply` |
+| `sglang_0.5.10_selfspec.patch` | changes to 22 existing source files plus `python/pyproject.toml` — `git apply` |
 | `python/sglang/srt/speculative/selfspec_diffusion_worker.py` | the new worker (the core of the implementation) |
 | `python/sglang/srt/speculative/selfspec_sampling.py` | AR-exact sampling, penalties and grammar masks for the verify rows (§9-6, §9-7) |
 | `python/sglang/srt/speculative/selfspec_commit_rules.py` | the host-side commit rules (finish checks with the per-token loop's semantics), dependency free |
@@ -255,9 +255,17 @@ logits_output, vid, _ = mwb.spec_info.verify(batch, batch_result.logits_output, 
 
 The worker then splices a0 in front of each request's returned tokens (ragged) and reports
 `accept_length + 1` to the scheduler; `spec_verify_ct` stays 1 per round, so the engine metric in §8-1 is
-unchanged. `return_logprob` is not supported on this path (a0's logit row lives in the draft forward): the worker
-raises on such a batch, inside the scheduler, which stops the server. Serve logprob requests with `MODE=ar`; RL
-rollouts that need logprobs run with `SELFSPEC_FULLDRAFT=0`.
+unchanged.
+
+Log probabilities (`return_logprob`, the OpenAI `logprobs` / `top_logprobs`) are recorded by the worker, as spec-v1
+workers must: the output processor leaves them to it. a0's logit row lives in the draft forward, so a batch that asks
+for them is treated like a sampling batch (§9-6): a0 is drawn by SGLang's sampler, which also returns a0's log
+probability, top-k and token-id log probabilities exactly as AR decoding computes them for that token (its temperature
+handling included). After the verify, `fulldraft_output_logprobs` appends, per request, a0's entry first and then one
+entry per verified token from the verify logits as processed for this round (`add_output_logprobs_for_spec_v1`, as
+SGLang's n-gram and EAGLE workers record theirs); a request that ends at a0 gets a0's entry only. Such a batch takes the
+per-token commit of this section, not the single-readback commit of §7-5, and no draft is launched ahead for it. Input
+(prompt) log probabilities come from the prefill, which self-spec leaves unchanged.
 
 ### 5-4b. VERIFY — legacy round (`SELFSPEC_FULLDRAFT=0`)
 Verify over the draft as is (`[x0, a0, d_1..d_{K-2}]`), reusing exactly the K slots the draft allocated:
@@ -395,7 +403,7 @@ the decode-latency fields that `managers/tokenizer_manager.py` adds to a self-sp
 only on a self-spec server.
 
 ### 6-5. Security fixes (every server built from the patch)
-Three upstream v0.5.10 behaviours change for every server, self-spec or not:
+Four upstream v0.5.10 behaviours change for every server, self-spec or not:
 - **Keys in the server info.** `/server_info`, `/get_server_info`, `Engine.get_server_info()`, the scheduler's internal
   state and the request / crash dumps returned or stored the API key and the admin key. They now return those fields
   (and `ssl_keyfile_password`) as `null`, and `ServerArgs` keeps them out of its `repr`, which SGLang logs at startup
@@ -408,6 +416,13 @@ Three upstream v0.5.10 behaviours change for every server, self-spec or not:
 - **The tokenizer workers' shared-memory segment.** It is created exclusively with mode 0600, a stale one left by this
   user is replaced, one owned by another user stops the startup, and a segment is unpickled only when this user owns
   it (`managers/multi_tokenizer_mixin.py`). It no longer carries the keys.
+- **The torch.distributed rendezvous of a single-node server.** Upstream connects it to `--host`, the HTTP bind
+  address, and torch's tcp:// rendezvous starts the TCPStore server on every interface whatever address it names, so
+  the store port was reachable from other hosts. A single-node server (one node, no `--dist-init-addr`, no
+  `SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE`) now rendezvouses on `127.0.0.1` (`model_executor/model_runner.py`
+  `_torch_dist_init_method`), and a rendezvous on a loopback address gets a store that listens on that address only:
+  rank 0 binds the socket and hands it to the TCPStore, everything else as torch's tcp:// rendezvous does it
+  (`distributed/parallel_state.py` `_loopback_rendezvous_store`). Multi-node setups and the override are unchanged.
 
 ---
 
@@ -438,11 +453,10 @@ FlashInfer's planner directly; both are checked at startup), no `--enable-dp-att
 `MaskMode.CUSTOM`, the real mask is copied into the buffer at replay, so one graph per bs handles both
 (`SELFSPEC_MASK=1`, default). This is the reference the mask-free path is checked against; port it first.
 
-> The tree also contains an older dual-graph (`(bs, causal)` key) implementation for `SELFSPEC_NOMASK=1`. It is a
-> different, failed experiment, not the mask-free path above. It is OFF by default and recorded as worse on both
-> correctness and speed: combined with cuda graphs it read a stale captured mask buffer and its output diverged from
-> AR. It is refused at startup together with `SELFSPEC_FASTATTN=1` or the full-draft round, and its graphs and causal
-> flag exist only on a self-spec server. When porting, do not use it.
+> An older dual-graph (`(bs, causal)` key) mask-free experiment, `SELFSPEC_NOMASK=1`, was removed from the patch: it
+> was off by default, refused with the full-draft round and with `SELFSPEC_FASTATTN=1`, and recorded as worse on both
+> correctness and speed (combined with cuda graphs it read a stale captured mask buffer). Nothing of it is left: no
+> flag, no dual graph key and no causal channel from the worker to the attention backend.
 
 ### 7-2. draft and verify share KV slots
 Previously draft allocated → cloned → freed and verify allocated again. Sharing makes `kv_indices`
@@ -451,24 +465,11 @@ overwrites the same slots with causal K/V (the draft's bidirectional K/V was thr
 round verify reuses slots [1:K] and allocates one new slot; slot 0 (x0) is committed straight from the
 draft forward, whose row 0 was causal.
 
-### 7-3. How the `causal` flag reaches attention (dual-graph path only)
-```
-worker         spec.selfspec_causal = False (draft) / True (verify)
-   ↓
-forward_batch_info.py    ret.dllm_ragged_causal = bool(_ss_causal)
-   ↓
-flashinfer_backend.py    wrapper.forward(causal=...)   (paged and ragged call sites)
-   ↓
-cuda_graph_runner.py     replay graphs[(bs, causal)]
-```
-Porting trap: the flag is read only at the paged call site, and only when `selfspec_nomask` is set. Multimodal
-models take the paged path (`use_ragged=False`); **a text-only model takes the ragged path and would need the same
-override there.** `dllm_ragged_causal` is a dynamic attribute on `ForwardBatch` (read with `getattr(..., False)`
-everywhere), so a typo passes silently — declare it as a dataclass field when porting.
-
-The mask-free path of §7-1 does not use this route: the role on `spec_info` selects the planner's per-role wrapper and
-sets the causal flag in the forward metadata. Its wrappers are paged for every model, so the paged/ragged gating above
-does not apply to it.
+### 7-3. How the draft / verify direction reaches attention
+On the custom-mask path the direction is in the mask contents (§7-1). On the mask-free path the role on `spec_info`
+(`selfspec_role = "draft" | "verify"`) selects the planner's per-role wrapper, sets the causal flag in the forward
+metadata, and keys the cuda graph (`(bs, role)`). Its wrappers are paged for every model, so a text-only model, which
+SGLang sends through the ragged path for extends, needs no separate override there.
 
 ### 7-4. cuda-graph lessons (do not repeat)
 1. `causal` is a Python scalar and is baked into the graph at capture → N modes = N graphs.
@@ -659,7 +660,7 @@ export PATH=<venv>/bin:$PATH           # cuda-graph capture shells out to ninja
 ## 10. Environment variables
 
 Reproduce this combination first (the unoptimized runtime, `FAST=0`): `SELFSPEC_FULLDRAFT=1` (default),
-`SELFSPEC_MASK=1` (default), `SELFSPEC_NOMASK=0`, cuda graphs ON. Then add the runtime optimizations (§7-5); the
+`SELFSPEC_MASK=1` (default), cuda graphs ON. Then add the runtime optimizations (§7-5); the
 output must not change.
 
 | env | default | purpose |
@@ -681,7 +682,6 @@ output must not change.
 | `SELFSPEC_CHECK` | `0` | diagnostic: per-forward host/device length, position and plan checks; raises on a mismatch (syncs; never time with it) |
 | `SELFSPEC_SHADOW` | `0` | diagnostic, with `SELFSPEC_FASTATTN=1`, eager forwards only: also run the mask path and compare every attention call bitwise |
 | `SELFSPEC_PADFIX` | `1` | custom-mask path only: pad the mask for the dummy rows of a padded graph replay |
-| `SELFSPEC_NOMASK` | `0` | older mask-free dual-graph path, not `SELFSPEC_FASTATTN`. Measured worse (correctness and speed) — experimental; refused with `SELFSPEC_FASTATTN=1` or `SELFSPEC_FULLDRAFT=1` |
 | `SELFSPEC_TRAIN_MASKS` | `0` | window K+1. Kills the kernel (§9-3); refused at startup with `SELFSPEC_FASTATTN=1` |
 | `SGLANG_NGRAM_FORCE_GREEDY_VERIFY` | `0` | force greedy verify even at temp > 0 (A/B) |
 | `SELFSPEC_DEBUG` | `0` | per-round accept + cumulative tok/fwd |

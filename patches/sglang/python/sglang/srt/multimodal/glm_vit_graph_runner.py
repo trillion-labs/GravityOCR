@@ -261,17 +261,22 @@ class GlmVitGraphRunner:
         CUDA context is unusable, e.g. after a device-side assert), the original error is raised."""
         self._check_maxm()
         mem0 = _mem()
+        failed = None
         try:
             self.capture()
         except Exception as e:
-            msg = (str(e).strip().splitlines() or [""])[0][:400]
+            failed = e
             _drop_frames(e)
+        if failed is not None:
+            # Released only here, after the except block: inside it the interpreter's handled-exception state and the
+            # traceback still reference capture()'s frames, so synchronize + empty_cache there could free nothing.
+            msg = (str(failed).strip().splitlines() or [""])[0][:400]
             try:
                 self.release()
             except Exception:
-                raise e  # the CUDA context is unusable: not recoverable here
+                raise failed  # the CUDA context is unusable: not recoverable here
             mem1 = _mem()
-            _p(f"OFF: capture failed ({type(e).__name__}: {msg}); released the partial graphs and buffers "
+            _p(f"OFF: capture failed ({type(failed).__name__}: {msg}); released the partial graphs and buffers "
                f"(mem {(mem1[0] - mem0[0]) / 1e9:+.2f} GB alloc / {(mem1[1] - mem0[1]) / 1e9:+.2f} GB reserved vs before "
                f"the capture); using the original eager forward")
             return False

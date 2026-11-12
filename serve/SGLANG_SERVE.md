@@ -55,15 +55,18 @@ The endpoint is a standard `/v1/chat/completions`: send `{image_url: data:image/
 "<task prompt>"}` with `temperature: 0` (greedy, what the released results use). Task prompts follow GLM-OCR
 (`Text Recognition:`, `Table Recognition:`, `Formula Recognition:`), one request per layout region. Spec mode
 also serves sampling settings, penalties, `logit_bias`, `min_tokens` and structured output (`response_format`)
-with AR's semantics (`docs/SGLANG_SELFSPEC_IMPL.md` §9-6, §9-7). It does not serve `logprobs` in the default
-full-draft round: such a request stops the server, so send it to `MODE=ar`.
+with AR's semantics (`docs/SGLANG_SELFSPEC_IMPL.md` §9-6, §9-7), and log probabilities (`logprobs` /
+`top_logprobs`, `/generate`'s `return_logprob`): one entry per generated token, the first token of each round from
+SGLang's sampler and the others from the verify pass (`docs/SGLANG_SELFSPEC_IMPL.md` §5-4).
 
 **Security.** The launcher binds `127.0.0.1` and sets no API or admin key, so every user on the host can reach
 SGLang's management endpoints (weight reloads from a caller-chosen path, profiling, cache control). On a shared host
 give the server keys through a mode-0600 YAML file, `EXTRA_ARGS="--config <file>"` with `api-key:` and
 `admin-api-key:` entries, rather than on the command line. The patch makes every tokenizer worker check them (upstream
 v0.5.10 checks keys only with one worker), and `/server_info` / `/get_server_info` return the configuration with
-both keys blanked.
+both keys blanked. The server's torch.distributed rendezvous runs on `127.0.0.1` with a store that listens on
+loopback only, whatever `--host` is (upstream v0.5.10 binds that store on every interface); gloo and NCCL still open
+sockets of their own, so a host reachable from untrusted networks needs a firewall that admits only the HTTP port.
 
 ## 2. Parity check (spec vs AR)
 
@@ -106,6 +109,6 @@ mask modes), a blocking copy per forward is gone (M-RoPE cache fix), the commit 
 the next round's draft is launched before the current round's host bookkeeping so that bookkeeping runs under GPU
 time. Multi-GPU data parallelism is the lever for aggregate throughput.
 
-The older `SELFSPEC_NOMASK=1` path is a different experiment and stays off: a dual-graph mask-free path that read a
-stale captured mask buffer under cuda graphs, and its output diverged from AR. The `FAST=1` attention path does not
-share that mechanism (`docs/SGLANG_SELFSPEC_IMPL.md` §7-1).
+An older mask-free experiment (`SELFSPEC_NOMASK=1`, a dual-graph path that read a stale captured mask buffer under cuda
+graphs) has been removed from the patch; the `FAST=1` attention path is a different mechanism
+(`docs/SGLANG_SELFSPEC_IMPL.md` §7-1).

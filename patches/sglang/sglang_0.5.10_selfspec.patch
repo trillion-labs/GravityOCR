@@ -14,6 +14,118 @@ index d388d275de0275553439edda3feec259a625c232..b87dce0fc9b9477838d3ab0733cf9716
    "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
    "torchvision",
    "tqdm",
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+index f0cba2189c0e8dfac92e6dfc8dbd87a47e364b44..b944e908139105d32fc3095c9be21271e891a45f 100644
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -24,9 +24,12 @@ If you only need to use the distributed environment without model/pipeline
+ 
+ import contextlib
+ import gc
++import ipaddress
+ import logging
+ import os
+ import pickle
++import socket
++import urllib.parse
+ import weakref
+ from collections import namedtuple
+ from contextlib import contextmanager, nullcontext
+@@ -1632,6 +1635,71 @@ def _create_global_tcp_store(rank: int, world_size: int) -> None:
+         )
+ 
+ 
++def _loopback_rendezvous_store(
++    distributed_init_method: str,
++    rank: int,
++    world_size: int,
++    backend: str,
++    timeout: Optional[timedelta],
++) -> Optional[torch.distributed.Store]:
++    """The store of a ``tcp://<loopback IP>:<port>`` rendezvous, listening on that address only.
++
++    torch's tcp:// rendezvous starts rank 0's TCPStore server on every interface (``::`` /
++    ``0.0.0.0``) whatever host the URL names, so even a loopback rendezvous opened a port that
++    other hosts can reach. For a URL whose host is a loopback IP literal, rank 0 binds that
++    address itself and hands the listening socket to the TCPStore (``master_listen_fd``).
++    Everything else is what torch's tcp:// rendezvous does (``_create_c10d_store``: rank 0
++    serves, the other ranks connect, multi-tenant, ``USE_LIBUV``; ``init_process_group``: the
++    backend's default timeout and the ``PrefixStore("default_pg", ...)`` around the store).
++    Returns None for any other init method, which torch then handles as before.
++    """
++    try:
++        url = urllib.parse.urlsplit(distributed_init_method)
++        host, port = url.hostname, url.port
++    except ValueError:
++        return None
++    if url.scheme != "tcp" or url.path or url.query or url.fragment:
++        return None
++    if host is None or port is None or rank < 0 or world_size < 1:
++        return None
++    try:
++        ip = ipaddress.ip_address(host)
++    except ValueError:  # a host name, not an IP literal
++        return None
++    if not ip.is_loopback:
++        return None
++    if os.environ.get("TORCHELASTIC_USE_AGENT_STORE") == str(True):
++        return None  # torchelastic's agent hosts the store
++    if timeout is None:
++        timeout = torch.distributed.distributed_c10d._get_default_timeout(
++            Backend(backend)
++        )
++    listen_fd = None
++    if rank == 0:
++        family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
++        sock = socket.socket(family, socket.SOCK_STREAM)
++        try:
++            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++            sock.bind((host, port))
++            sock.listen(socket.SOMAXCONN)
++        except BaseException:
++            sock.close()
++            raise
++        # The TCPStore server owns the descriptor from here on (it closes it on shutdown).
++        listen_fd = sock.detach()
++    store = torch.distributed.TCPStore(
++        host_name=host,
++        port=port,
++        world_size=world_size,
++        is_master=rank == 0,
++        timeout=timeout,
++        multi_tenant=True,
++        master_listen_fd=listen_fd,
++        use_libuv=os.environ.get("USE_LIBUV", "1") == "1",
++    )
++    return torch.distributed.PrefixStore("default_pg", store)
++
++
+ def init_distributed_environment(
+     world_size: int = -1,
+     rank: int = -1,
+@@ -1672,14 +1740,21 @@ def init_distributed_environment(
+ 
+         pg_options = get_torch_distributed_pg_options()
+ 
++        # A loopback tcp:// rendezvous gets a store that listens on loopback only
++        # (torch's own tcp:// rendezvous listens on every interface).
++        store = _loopback_rendezvous_store(
++            distributed_init_method, rank, world_size, backend, timeout
++        )
++
+         # this backend is used for WORLD
+         torch.distributed.init_process_group(
+             backend=backend,
+-            init_method=distributed_init_method,
++            init_method=distributed_init_method if store is None else None,
+             world_size=world_size,
+             rank=rank,
+             timeout=timeout,
+             pg_options=pg_options,
++            store=store,
+         )
+ 
+         # Create a global TCPStore for coordination (used by NIXL)
 diff --git a/python/sglang/srt/entrypoints/engine.py b/python/sglang/srt/entrypoints/engine.py
 index aca1adc26f93d2aa9eae6dfcd114be8a9b4c6082..252604a817bea12fbb01e8201f494a8e91811563 100644
 --- a/python/sglang/srt/entrypoints/engine.py
@@ -238,7 +350,7 @@ index 6978e0c062e897f0680bf25c14524d3813647efc..0504b4311a85e01bc494a34bc055bb3d
      server_args: ServerArgs,
      init_tokenizer_manager_func: Callable = init_tokenizer_manager,
 diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
-index 4fe8aec313015ecd0f10d13a8e532746582bbf63..40b4ce646ec07561766a45a833bb79e7ca00ca93 100644
+index 4fe8aec313015ecd0f10d13a8e532746582bbf63..ee21423ebc9f56126002d5c4d75e82ecac68fe5a 100644
 --- a/python/sglang/srt/layers/attention/flashinfer_backend.py
 +++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
 @@ -16,6 +16,10 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
@@ -268,23 +380,15 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..40b4ce646ec07561766a45a833bb79e7
  
  
  # Reuse this workspace buffer across all flashinfer wrappers
-@@ -137,6 +150,29 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -137,6 +150,19 @@ class FlashInferAttnBackend(AttentionBackend):
          # FIXME: remove dllm workarounds from flashinfer
          self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
          self.is_dllm_model = self.dllm_config is not None
-+        # SELFSPEC mask-free path. The two self-spec masks are element-wise identical to the kernel's
-+        # built-in modes (verified):
-+        #   verify = all-ones prefix ++ tril(K,K)   == flashinfer CAUSAL (bottom-right aligned)
-+        #   draft  = all-ones prefix ++ bidir block == NON_CAUSAL   (row 0 differs slightly, see below)
-+        # So no mask tensor is needed; only the causal scalar changes. That removes segment_packbits
-+        # (and its internal .item() sync) and the mask D2H/copy from plan(), and eliminates the
-+        # buffer-overrun crash. But causal is baked into the graph, so draft/verify need two graphs
-+        # (cuda_graph_runner.is_dual_causal_graph). SELFSPEC_NOMASK=0 restores the mask path (default).
++        # Self-spec servers (SELFSPEC_DIFFUSION) only; every other server keeps upstream's behaviour.
 +        self.is_selfspec = bool(
 +            getattr(model_runner, "spec_algorithm", None) is not None
 +            and model_runner.spec_algorithm.is_selfspec_diffusion()
 +        )
-+        self.selfspec_nomask = self.is_selfspec and os.environ.get("SELFSPEC_NOMASK", "0") == "1"
 +        # SELFSPEC_FASTATTN=1: mask-free + sync-free draft/verify attention (speculative/selfspec_fast_attn.py).
 +        # Built after the wrappers/updaters below (needs indices_updater_prefill); default OFF = the old custom-mask path unchanged.
 +        self.selfspec_fast = False
@@ -292,13 +396,11 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..40b4ce646ec07561766a45a833bb79e7
 +            from sglang.srt.speculative.selfspec_fast_attn import fastattn_enabled as _ss_fastattn_enabled
 +
 +            self.selfspec_fast = bool(_ss_fastattn_enabled() and not skip_prefill)
-+        if self.selfspec_fast and self.selfspec_nomask:
-+            raise ValueError("SELFSPEC_FASTATTN=1 and SELFSPEC_NOMASK=1 are mutually exclusive")
 +        self.ss_planner = None
  
          # Parse constants
          self.decode_use_tensor_cores = should_use_tensor_core(
-@@ -305,6 +341,17 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -305,6 +331,17 @@ class FlashInferAttnBackend(AttentionBackend):
          self.prefill_cuda_graph_metadata = {}  # For verify
          self.draft_extend_cuda_graph_metadata = {}  # For draft extend
  
@@ -316,7 +418,7 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..40b4ce646ec07561766a45a833bb79e7
      def _process_multi_item_scoring(
          self, forward_batch: ForwardBatch
      ) -> MultiItemScoringParams:
-@@ -456,6 +503,30 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -456,6 +493,30 @@ class FlashInferAttnBackend(AttentionBackend):
              self.forward_metadata = PrefillMetadata(
                  self.prefill_wrappers_paged, False, False
              )
@@ -347,7 +449,7 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..40b4ce646ec07561766a45a833bb79e7
          elif forward_batch.forward_mode.is_target_verify():
              self.indices_updater_prefill.update(
                  forward_batch.req_pool_indices,
-@@ -595,6 +666,9 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -595,6 +656,9 @@ class FlashInferAttnBackend(AttentionBackend):
                  decode_wrappers[i].begin_forward = partial(
                      fast_decode_plan, decode_wrappers[i]
                  )
@@ -357,29 +459,7 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..40b4ce646ec07561766a45a833bb79e7
          elif forward_mode.is_target_verify():
              prefill_wrappers = []
              for i in range(self.num_wrappers):
-@@ -608,8 +682,19 @@ class FlashInferAttnBackend(AttentionBackend):
-                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
--                        custom_mask_buf=self.cuda_graph_custom_mask,
--                        mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
-+                        # On the mask-free path custom_mask_buf is NOT passed at all: flashinfer decides
-+                        # `if self._custom_mask_buf is not None: mask_mode = CUSTOM` inside run(), and that
-+                        # decision is baked into the graph at capture time. A buffer given to the
-+                        # constructor therefore pins CUSTOM mode even when plan(custom_mask=None) is called,
-+                        # and the kernel reads a stale buffer.
-+                        **(
-+                            {}
-+                            if self.selfspec_nomask
-+                            else {
-+                                "custom_mask_buf": self.cuda_graph_custom_mask,
-+                                "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
-+                            }
-+                        ),
-                     )
-                 )
-             seq_lens_sum = seq_lens.sum().item()
-@@ -711,6 +796,11 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -711,6 +775,11 @@ class FlashInferAttnBackend(AttentionBackend):
                  fixed_split_size=None,
                  disable_split_kv=self.disable_cuda_graph_kv_split,
              )
@@ -391,19 +471,13 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..40b4ce646ec07561766a45a833bb79e7
          elif forward_mode.is_target_verify():
              self.indices_updater_prefill.update(
                  req_pool_indices[:bs],
-@@ -783,10 +873,25 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -783,10 +852,19 @@ class FlashInferAttnBackend(AttentionBackend):
                          layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                      )
  
 +            paged_causal = not layer.is_cross_attention
 +            if self.is_selfspec:
 +                # Self-spec servers only (every other model, dLLMs included, keeps upstream's causal flag).
-+                # SELFSPEC_NOMASK=1: the block goes through this paged wrapper without a mask; causal=False -> block
-+                # queries attend to the whole KV (committed prefix + all block positions) = the DRAFT mask, causal=True
-+                # -> block-internal causal = the VERIFY mask. Per forward via forward_batch.dllm_ragged_causal (set from
-+                # spec_info.selfspec_causal in ForwardBatch.init_new).
-+                if self.selfspec_nomask:
-+                    paged_causal = bool(getattr(forward_batch, "dllm_ragged_causal", False))
 +                # SELFSPEC_FASTATTN: verify = CAUSAL; draft = NON_CAUSAL here (mask rows), then the same plan CAUSAL below with
 +                # its row 0 (seed) copied into row 0. One request per sequence, as before; the wrapper has no custom mask.
 +                _ssc = getattr(self.forward_metadata, "ss_causal", None)
@@ -418,7 +492,7 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..40b4ce646ec07561766a45a833bb79e7
                  sm_scale=layer.scaling,
                  # Disable sliding window attention for multi-item scoring:
                  # - Sliding window could cut across item boundaries, breaking semantic coherence
-@@ -807,6 +912,39 @@ class FlashInferAttnBackend(AttentionBackend):
+@@ -807,6 +885,39 @@ class FlashInferAttnBackend(AttentionBackend):
                  k_scale=layer.k_scale_float,
                  v_scale=layer.v_scale_float,
              )
@@ -458,7 +532,7 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..40b4ce646ec07561766a45a833bb79e7
          else:
              # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
              # `forward_batch.token_to_kv_pool` for this layer. This enables attention over
-@@ -1490,6 +1628,24 @@ class FlashInferIndicesUpdaterPrefill:
+@@ -1490,6 +1601,24 @@ class FlashInferIndicesUpdaterPrefill:
              token_pos_in_items_len = 0
              max_item_len_ptr = None
  
@@ -483,7 +557,7 @@ index 4fe8aec313015ecd0f10d13a8e532746582bbf63..40b4ce646ec07561766a45a833bb79e7
          wrapper_paged.begin_forward(
              qo_indptr,
              kv_indptr,
-@@ -1503,7 +1659,7 @@ class FlashInferIndicesUpdaterPrefill:
+@@ -1503,7 +1632,7 @@ class FlashInferIndicesUpdaterPrefill:
              kv_data_type=self.data_type,
              custom_mask=use_custom_mask,
              non_blocking=True,
@@ -898,7 +972,7 @@ index ba777330000f86e3e8655519f47a5d4ff3049a09..ddc09c3c478edf6eff97a695bce353bf
          """Copy tensors to CPU in overlap scheduling.
          Only the tensors which are needed for processing results are copied,
 diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
-index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c550a21b4 100644
+index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..9686ef80392cacd0fbe0e90cfee17037b89cbe59 100644
 --- a/python/sglang/srt/model_executor/cuda_graph_runner.py
 +++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
 @@ -264,6 +264,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
@@ -931,7 +1005,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
  
          if require_gathered_buffer:
              self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
-@@ -501,6 +513,30 @@ def set_global_graph_memory_pool(val):
+@@ -501,6 +513,20 @@ def set_global_graph_memory_pool(val):
      global_graph_memory_pool = val
  
  
@@ -939,30 +1013,20 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
 +    """(graph key, extra capture_one_batch_size kwargs) of each graph CudaGraphRunner.capture() records per batch size.
 +
 +    Upstream (and every runner that is not a self-spec runner): one graph keyed base_key, captured with
-+    capture_one_batch_size(bs, forward, stream_idx) and no extra argument. A self-spec runner (SELFSPEC_DIFFUSION)
-+    captures one graph per intra-block causal flag with SELFSPEC_NOMASK=1 (key (base_key, causal), kwarg dllm_causal)
-+    and one per role with SELFSPEC_FASTATTN=1 (key (base_key, role), kwarg ss_role); __init__ refuses both together.
-+    The flags are read with getattr: the EAGLE / EAGLE3 / NEXTN / STANDALONE draft runners call
++    capture_one_batch_size(bs, forward, stream_idx) and no extra argument. A self-spec runner (SELFSPEC_DIFFUSION) with
++    SELFSPEC_FASTATTN=1 captures one graph per role (key (base_key, role), kwarg ss_role).
++    The flag is read with getattr: the EAGLE / EAGLE3 / NEXTN / STANDALONE draft runners call
 +    CudaGraphRunner.capture(self) without running CudaGraphRunner.__init__, and their capture_one_batch_size
-+    accepts neither kwarg."""
-+    causal_flags = (False, True) if getattr(runner, "is_dual_causal_graph", False) else (None,)
-+    roles = ("draft", "verify") if getattr(runner, "ss_fast", False) else (None,)
-+    variants = []
-+    for causal in causal_flags:
-+        for role in roles:
-+            key, kwargs = base_key, {}
-+            if causal is not None:
-+                key, kwargs["dllm_causal"] = (key, causal), causal
-+            if role is not None:
-+                key, kwargs["ss_role"] = (key, role), role
-+            variants.append((key, kwargs))
-+    return variants
++    does not accept the kwarg."""
++    if not getattr(runner, "ss_fast", False):
++        return [(base_key, {})]
++    return [((base_key, role), {"ss_role": role}) for role in ("draft", "verify")]
 +
 +
  class CudaGraphRunner:
      """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
  
-@@ -543,6 +579,51 @@ class CudaGraphRunner:
+@@ -543,6 +569,39 @@ class CudaGraphRunner:
  
          self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
          self.is_dllm = self.dllm_config is not None
@@ -971,16 +1035,6 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
 +        self.is_selfspec = bool(
 +            getattr(model_runner, "spec_algorithm", None) is not None
 +            and model_runner.spec_algorithm.is_selfspec_diffusion()
-+        )
-+        # SELFSPEC_NOMASK=1 (experimental, default off) alternates a bidirectional block draft and a causal verify
-+        # without masks: causal reaches wrapper.forward(causal=...) as a Python scalar and is baked into the graph
-+        # at capture, so it needs two graphs per bs, keyed (bs, causal).
-+        # NOTE: dual graphs only on the mask-free path. Capturing twice at the same bs overwrites
-+        # flashinfer's prefill_cuda_graph_metadata[bs] with the second wrapper set: the first graph
-+        # replays kernels bound to buffer set A while plan() updates set B ->
-+        # mismatched metadata and corrupted output (observed on the mask path).
-+        self.is_dual_causal_graph = bool(
-+            self.is_selfspec and os.environ.get("SELFSPEC_NOMASK", "0") == "1"
 +        )
 +        # SELFSPEC_FASTATTN=1: mask-free draft/verify attention -> one graph per (bs, role), each role with its
 +        # own flashinfer wrapper / metadata buffers (speculative/selfspec_fast_attn.py). Default OFF = one custom-mask graph per bs.
@@ -991,8 +1045,6 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
 +        )
 +        if self.is_selfspec and not self.ss_fast and os.environ.get("SELFSPEC_FASTATTN", "0") == "1":
 +            raise ValueError("SELFSPEC_FASTATTN=1 but the attention backend has no fast-path planner")
-+        if self.ss_fast and self.is_dual_causal_graph:
-+            raise ValueError("SELFSPEC_FASTATTN=1 cannot be combined with SELFSPEC_NOMASK=1 (dual-causal graphs)")
 +        # SELFSPEC_PADFIX (old custom-mask path only): pad the mask for the dummy rows of a padded replay (out-of-bounds mask read).
 +        # Default 1: a bug fix touching only dummy rows; SELFSPEC_PADFIX=0 restores the unpadded behavior exactly.
 +        # The fast path has no mask, so it is moot there.
@@ -1014,7 +1066,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
  
          self.capture_forward_mode = ForwardMode.DECODE
          self.capture_hidden_mode = CaptureHiddenMode.NULL
-@@ -551,6 +632,7 @@ class CudaGraphRunner:
+@@ -551,6 +610,7 @@ class CudaGraphRunner:
              model_runner.spec_algorithm.is_eagle()
              or model_runner.spec_algorithm.is_standalone()
              or model_runner.spec_algorithm.is_ngram()
@@ -1022,21 +1074,19 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
          ):
              if self.model_runner.is_draft_worker:
                  raise RuntimeError("This should not happen")
-@@ -679,6 +761,13 @@ class CudaGraphRunner:
+@@ -679,6 +739,11 @@ class CudaGraphRunner:
          graph_key = cuda_graph_bs
          if self.enable_pdmux:
              graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
 +        # With --disable-cuda-graph-padding the membership test must use the key replay() will use
-+        # (dual-causal graphs are keyed (bs, causal), fast-path graphs (bs, role)); the bare bs key is never in self.graphs there,
-+        # so every forward would silently run eager.
-+        if self.is_dual_causal_graph:
-+            graph_key = (graph_key, bool(getattr(forward_batch, "dllm_ragged_causal", False)))
++        # (fast-path graphs are keyed (bs, role)); the bare bs key is never in self.graphs there, so every forward would
++        # silently run eager.
 +        if self.ss_fast:
 +            graph_key = (graph_key, getattr(forward_batch.spec_info, "selfspec_role", None))
  
          is_bs_supported = (
              graph_key in self.graphs
-@@ -720,16 +809,70 @@ class CudaGraphRunner:
+@@ -720,16 +785,70 @@ class CudaGraphRunner:
                  forward_batch.batch_size * self.num_tokens_per_bs
                  == forward_batch.input_ids.numel()
              )
@@ -1108,7 +1158,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
          )
  
      def _init_profile_context_and_memory_record(self):
-@@ -790,14 +933,17 @@ class CudaGraphRunner:
+@@ -790,14 +909,17 @@ class CudaGraphRunner:
                      num_tokens=bs * self.num_tokens_per_bs,
                      tp_group=self.model_runner.tp_group,
                  ) as forward:
@@ -1133,7 +1183,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
  
          # Trigger CUDA graph capture for specific shapes.
          # Capture the large shapes first so that the smaller shapes
-@@ -837,7 +983,12 @@ class CudaGraphRunner:
+@@ -837,7 +959,11 @@ class CudaGraphRunner:
          return torch.cuda.CUDAGraph()
  
      def capture_one_batch_size(
@@ -1142,12 +1192,11 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
 +        bs: int,
 +        forward: Callable,
 +        stream_idx: Optional[int] = None,
-+        dllm_causal: Optional[bool] = None,
 +        ss_role: Optional[str] = None,
      ):
          buffers: DecodeInputBuffers = self.buffers
          graph = self._create_device_graph()
-@@ -901,6 +1052,8 @@ class CudaGraphRunner:
+@@ -901,6 +1027,8 @@ class CudaGraphRunner:
              global_dp_buffer_len = None
  
          spec_info = self.get_spec_info(num_tokens)
@@ -1156,22 +1205,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
          if self.capture_hidden_mode != CaptureHiddenMode.FULL:
              self.capture_hidden_mode = (
                  spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
-@@ -964,6 +1117,14 @@ class CudaGraphRunner:
-             lora_ids=lora_ids,
-         )
- 
-+        # SELFSPEC_NOMASK=1 (self-spec only; None everywhere else): the block-internal attention causal is a python
-+        # bool passed to wrapper.forward(causal=...) -> BAKED into the captured kernel. DRAFT needs bidir
-+        # (causal=False), VERIFY needs causal (causal=True), so we capture TWO graphs per bs and
-+        # pick at replay by forward_batch.dllm_ragged_causal. The flashinfer wrapper's planned
-+        # metadata is causal-agnostic, so both graphs share it (only the baked forward() differs).
-+        if dllm_causal is not None:
-+            forward_batch.dllm_ragged_causal = dllm_causal
-+
-         # HiSparse: set coordinator so the hisparse code path is captured into the graph
-         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
-         if forward_batch.hisparse_coordinator is not None:
-@@ -1103,6 +1264,7 @@ class CudaGraphRunner:
+@@ -1103,6 +1231,7 @@ class CudaGraphRunner:
                  self.model_runner.server_args
              ),
              pp_proxy_tensors=pp_proxy_tensors,
@@ -1179,7 +1213,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
          )
          if self.enable_two_batch_overlap:
              self.tbo_plugin.replay_prepare(
-@@ -1111,8 +1273,24 @@ class CudaGraphRunner:
+@@ -1111,8 +1240,24 @@ class CudaGraphRunner:
                  num_token_non_padded=len(forward_batch.input_ids),
                  spec_info=forward_batch.spec_info,
              )
@@ -1188,7 +1222,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
 +        if (
 +            forward_batch.forward_mode.is_idle()
 +            and forward_batch.spec_info is not None
-+            and not (self.is_selfspec and (os.environ.get("SELFSPEC_NOMASK", "0") == "1" or self.ss_fast))
++            and not self.ss_fast
 +        ):
              forward_batch.spec_info.custom_mask = buffers.custom_mask
 +        # SELFSPEC_PADFIX=1 (old custom-mask path): when raw_bs is not a captured size the replay runs at
@@ -1205,7 +1239,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
          # Attention backend
          if self.enable_pdmux:
              stream_idx = get_current_stream_idx()
-@@ -1146,6 +1324,10 @@ class CudaGraphRunner:
+@@ -1146,6 +1291,10 @@ class CudaGraphRunner:
      ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
          self.deepep_adapter.replay()
  
@@ -1216,14 +1250,10 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
          if not skip_attn_backend_init:
              self.replay_prepare(forward_batch, pp_proxy_tensors)
          else:
-@@ -1158,7 +1340,38 @@ class CudaGraphRunner:
+@@ -1158,7 +1307,34 @@ class CudaGraphRunner:
              graph_key = f"{get_current_stream_idx()}_{self.bs}"
          else:
              graph_key = self.bs
-+        # SELFSPEC_NOMASK=1: two graphs per bs (bidir draft / causal verify) — pick by the current
-+        # forward's causal flag (set by the self-spec worker: False=draft, True=verify).
-+        if self.is_dual_causal_graph:
-+            graph_key = (graph_key, bool(getattr(forward_batch, "dllm_ragged_causal", False)))
 +        if self.ss_fast:
 +            _role = getattr(forward_batch.spec_info, "selfspec_role", None)
 +            if _role is None:
@@ -1255,7 +1285,7 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
          output = self.output_buffers[graph_key]
  
          if isinstance(output, LogitsProcessorOutput):
-@@ -1210,12 +1423,29 @@ class CudaGraphRunner:
+@@ -1210,12 +1386,25 @@ class CudaGraphRunner:
                      seq_lens_cpu=None,
                  )
  
@@ -1272,23 +1302,19 @@ index c7c7d6b5ec0bee91c8f581ae839965a2c02dc495..514f8a22ed41398fb738cd1b1ee4e28c
 +            #   (2) the crash from a context-proportional mask overflowing the fixed buffer is eliminated.
 +            # Capturing WITH a mask bakes a read of buffers.custom_mask into the graph, but at runtime
 +            # nothing copies our mask into that buffer, so attention would run on garbage -> corrupted output.
-+            # Capture, runtime and backend must all read the SAME flag (SELFSPEC_NOMASK): if only the capture
-+            # passed a mask while the worker skipped it, flashinfer would demand custom_mask_buf and crash.
-+            # On the mask-free path the wrapper is created without custom_mask_buf (MaskMode fixed to
-+            # CAUSAL/NON_CAUSAL) and direction is selected by having two graphs (draft/verify).
-+            _selfspec_nomask = (
-+                self.model_runner.spec_algorithm.is_selfspec_diffusion()
-+                and (os.environ.get("SELFSPEC_NOMASK", "0") == "1" or self.ss_fast)
-+            )
++            # Capture, runtime and backend must all read the SAME flag (ss_fast = SELFSPEC_FASTATTN=1 with the backend's
++            # planner): if only the capture passed a mask while the worker skipped it, flashinfer would demand a mask
++            # buffer and crash. The fast path's own wrappers (speculative/selfspec_fast_attn.py) have no mask buffer, and
++            # its graphs are keyed (bs, role).
              spec_info = NgramVerifyInput(
                  draft_token=None,
 -                tree_mask=self.buffers.custom_mask,
-+                tree_mask=None if _selfspec_nomask else self.buffers.custom_mask,
++                tree_mask=None if self.ss_fast else self.buffers.custom_mask,
                  positions=None,
                  retrive_index=None,
                  retrive_next_token=None,
 diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
-index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..1d3749343f3541188ad04300c04cc777cf5e8767 100644
+index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..c9b6759b7c4f09bbaa06073eca8cb1eff29238d3 100644
 --- a/python/sglang/srt/model_executor/forward_batch_info.py
 +++ b/python/sglang/srt/model_executor/forward_batch_info.py
 @@ -77,6 +77,81 @@ if TYPE_CHECKING:
@@ -1373,22 +1399,7 @@ index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..1d3749343f3541188ad04300c04cc777
  
  class ForwardMode(IntEnum):
      # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
-@@ -541,6 +616,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
-         ):
-             ret.positions = ret.spec_info.positions
- 
-+        # SELFSPEC_NOMASK=1 (self-spec servers only): the intra-block causal flag travels on spec_info and is read here
-+        # (draft=False=bidirectional, verify=True=causal). It is both the attention wrapper's causal kwarg
-+        # and part of the cuda-graph key, so it needs a channel from the worker to ForwardBatch.
-+        if model_runner.spec_algorithm.is_selfspec_diffusion():
-+            _ss_causal = getattr(ret.spec_info, "selfspec_causal", None)
-+            if _ss_causal is not None:
-+                ret.dllm_ragged_causal = bool(_ss_causal)
-+
-         # Init position information
-         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
-             if ret.positions is None:
-@@ -715,6 +798,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+@@ -715,6 +790,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
  
          else:  # target_verify or draft_decode
              seq_positions = batch.spec_info.positions.view(batch_size, -1)
@@ -1401,10 +1412,39 @@ index eaecdc54bcf4fb9c14d6c64f67dbf7a6c7d2eba4..1d3749343f3541188ad04300c04cc777
              if all(mm_input is None for mm_input in mm_inputs):
                  mrope_delta_tensor = torch.zeros(
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index a59742b9435445d71c2d583a51e56ec782f3e95a..72f6630d18875724f45f83f43932425668b064ee 100644
+index a59742b9435445d71c2d583a51e56ec782f3e95a..7ef401c3f0fba3a43f08076c05871282696605aa 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
-@@ -344,6 +344,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -283,6 +283,28 @@ class ModelRunnerOutput:
+     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+ 
+ 
++def _torch_dist_init_method(server_args: ServerArgs, dist_port: int) -> str:
++    """The torch.distributed init method of this server's TP / PP group.
++
++    A single-node server (``nnodes == 1``, no ``--dist-init-addr``) rendezvouses on loopback,
++    where all of its ranks run, and init_distributed_environment binds a loopback rendezvous's
++    store to loopback only. ``--host`` is the HTTP bind address: upstream v0.5.10 used it here,
++    which put the store's address on whatever interface the HTTP server was bound to.
++    """
++    # Allow external orchestrators (e.g. trainpi) to override the distributed
++    # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
++    # env-vars and an externally-created TCPStore, completely avoiding port
++    # conflicts with intra-host collocation.
++    dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
++    if dist_init_method_override:
++        return dist_init_method_override
++    if server_args.dist_init_addr:
++        return NetworkAddress.parse(server_args.dist_init_addr).to_tcp()
++    if server_args.nnodes == 1:
++        return NetworkAddress("127.0.0.1", dist_port).to_tcp()
++    return NetworkAddress(server_args.host or "127.0.0.1", dist_port).to_tcp()
++
++
+ class ModelRunner(ModelRunnerKVCacheMixin):
+     """ModelRunner runs the forward passes of the models."""
+ 
+@@ -344,6 +366,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
          self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
          self.attention_chunk_size = model_config.attention_chunk_size
          self.forward_pass_id = 0
@@ -1413,7 +1453,29 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..72f6630d18875724f45f83f439324256
          self.init_new_workspace = False
          self.draft_model_idx = draft_model_idx
          self.enable_hisparse = server_args.enable_hisparse
-@@ -2087,6 +2089,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -914,20 +938,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         if not self.server_args.enable_p2p_check:
+             monkey_patch_p2p_access_check()
+ 
+-        # Allow external orchestrators (e.g. trainpi) to override the distributed
+-        # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
+-        # env-vars and an externally-created TCPStore, completely avoiding port
+-        # conflicts with intra-host collocation.
+-        dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
+-        if dist_init_method_override:
+-            dist_init_method = dist_init_method_override
+-        elif self.server_args.dist_init_addr:
+-            na = NetworkAddress.parse(self.server_args.dist_init_addr)
+-            dist_init_method = na.to_tcp()
+-        else:
+-            dist_init_method = NetworkAddress(
+-                self.server_args.host or "127.0.0.1", self.dist_port
+-            ).to_tcp()
++        dist_init_method = _torch_dist_init_method(self.server_args, self.dist_port)
+         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
+         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
+         set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
+@@ -2087,6 +2098,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              self.spec_algorithm.is_eagle()
              or self.spec_algorithm.is_standalone()
              or self.spec_algorithm.is_ngram()
@@ -1421,7 +1483,7 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..72f6630d18875724f45f83f439324256
          ):
              return not self.is_draft_worker
  
-@@ -2121,6 +2124,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2121,6 +2133,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              self.spec_algorithm.is_eagle()
              or self.spec_algorithm.is_standalone()
              or self.spec_algorithm.is_ngram()
@@ -1429,7 +1491,7 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..72f6630d18875724f45f83f439324256
          ):
              if self.is_draft_worker:
                  raise RuntimeError("This should not happen")
-@@ -2270,7 +2274,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2270,7 +2283,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                          seq_lens_cpu=None,
                      )
  
@@ -1441,7 +1503,7 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..72f6630d18875724f45f83f439324256
                  from sglang.srt.speculative.ngram_info import NgramVerifyInput
  
                  spec_info = NgramVerifyInput(
-@@ -2732,10 +2739,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2732,10 +2748,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
      ) -> ModelRunnerOutput:
          self.forward_pass_id += 1
  
@@ -1459,7 +1521,7 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..72f6630d18875724f45f83f439324256
              output = self._forward_raw(
                  forward_batch,
                  skip_attn_backend_init,
-@@ -2743,6 +2757,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2743,6 +2766,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                  reinit_attn_backend,
                  split_forward_count,
              )
@@ -1474,7 +1536,7 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..72f6630d18875724f45f83f439324256
              elastic_ep_state = ElasticEPStateManager.instance()
              if (
                  elastic_ep_state is not None
-@@ -2779,6 +2801,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2779,6 +2810,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
          if dumper.may_enable:
              dumper.step()
  
@@ -1487,7 +1549,7 @@ index a59742b9435445d71c2d583a51e56ec782f3e95a..72f6630d18875724f45f83f439324256
          return output
  
      def _forward_raw(
-@@ -2794,11 +2822,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -2794,11 +2831,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              if self.device == "cpu"
              else forward_batch.forward_mode.is_cuda_graph
          )
