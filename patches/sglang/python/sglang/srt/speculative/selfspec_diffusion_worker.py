@@ -44,6 +44,7 @@ from sglang.srt.speculative.selfspec_fast_commit import (
 from sglang.srt.speculative.selfspec_sampling import (
     KNOWN_PENALIZERS,
     chain_retrieve_cpu,
+    clear_cached_vocab_mask,
     fulldraft_bitmask,
     is_plain,
 )
@@ -231,6 +232,9 @@ def _resolve_block_diffusion(server_args: ServerArgs):
 # Grammar backends whose grammar objects support what the verify rows need: accept / rollback along the draft chain and the packed
 # int32 token bitmask that spec_utils.traverse_tree reads (the same requirement as SGLang's EAGLE / n-gram verify with a grammar).
 _SELFSPEC_GRAMMAR_BACKENDS = ("xgrammar", "llguidance", "none")
+# Sampling backends whose filters verify_target_probs reproduces for the sampled verify rows (a sampled request otherwise stops the
+# scheduler at its first round); checked at startup with the grammar backend.
+_SELFSPEC_SAMPLING_BACKENDS = ("flashinfer", "pytorch")
 
 
 def _check_sampling_support(server_args: ServerArgs):
@@ -261,6 +265,12 @@ def _check_sampling_support(server_args: ServerArgs):
             f"SELFSPEC_DIFFUSION verifies a draft chain under the request's grammar, which needs a grammar backend with rollback and "
             f"the packed token bitmask: {', '.join(_SELFSPEC_GRAMMAR_BACKENDS)} (got --grammar-backend {gb}; SGLang's EAGLE / n-gram "
             f"verify has the same requirement). The default, xgrammar, has both."
+        )
+    sb = server_args.sampling_backend
+    if sb not in _SELFSPEC_SAMPLING_BACKENDS:
+        raise ValueError(
+            f"SELFSPEC_DIFFUSION computes the sampled verify rows' AR distribution with the filters of SGLang's {' or '.join(_SELFSPEC_SAMPLING_BACKENDS)} "
+            f"sampling backend (selfspec_sampling.verify_target_probs); got --sampling-backend {sb}"
         )
 
 
@@ -489,7 +499,7 @@ class SelfSpecDiffusionWorker:
         grammar, no return_logprob. Host attributes only. A plain batch runs the greedy round unchanged (a0 = the draft argmax,
         verify on the raw logits, no cumulation, fast commit / draft-ahead as configured). Any other batch draws a0 with SGLang's
         sampler (_sample_a0), which also computes a0's log probability when the batch asks for them."""
-        return is_plain(batch.sampling_info, batch.has_grammar) and not batch.return_logprob
+        return is_plain(batch.sampling_info, batch.has_grammar, batch.reqs) and not batch.return_logprob
 
     def _sample_a0(self, batch: ScheduleBatch, logits: torch.Tensor) -> torch.Tensor:
         """Non-plain batch: a0 = SGLang's own sampler on the draft's causal row 0 (the AR logits of the token after the seed x0),
@@ -505,6 +515,8 @@ class SelfSpecDiffusionWorker:
         self._a0_lo for _fulldraft_verify, which records them before the verify rows' (fulldraft_output_logprobs)."""
         si = batch.sampling_info
         lo = LogitsProcessorOutput(next_token_logits=logits[:, 0].float().clone())   # a copy: the draft logits may be a graph buffer
+        if si.grammars:   # rows without a live grammar must be all-allowed; llguidance's cached buffer still holds the last verify's rows
+            clear_cached_vocab_mask(si.grammars, si.vocab_size, len(si.temperatures), si.device)
         self.model_runner._preprocess_logits(lo, si)
         rl = bool(batch.return_logprob)
         a0 = self.model_runner.sampler(lo, si, rl, batch.top_logprobs_nums if rl else None,
@@ -1251,6 +1263,7 @@ class SelfSpecDiffusionWorker:
         if batch.has_grammar:
             # the chain root x0 is already in the grammar: the stock n-gram bitmask (row j = state after x0, d1..dj)
             nxt, sib = chain_retrieve_cpu(K)
+            clear_cached_vocab_mask([r.grammar for r in batch.reqs], batch.sampling_info.vocab_size, draft_cpu.numel(), "cpu")
             vocab_mask = generate_token_bitmask(batch.reqs, verify_input, nxt.expand(bs, K), sib.expand(bs, K), draft_cpu,
                                                 batch.sampling_info.vocab_size)
             if vocab_mask is not None:

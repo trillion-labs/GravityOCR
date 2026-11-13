@@ -37,21 +37,49 @@ MIN_NEW_TOKENS = "BatchedMinNewTokensPenalizer"
 KNOWN_PENALIZERS = frozenset((REPETITION, FREQUENCY, PRESENCE, MIN_NEW_TOKENS))
 
 
-def is_plain(sampling_info, has_grammar: bool) -> bool:
+def is_plain(sampling_info, has_grammar: bool, reqs=None) -> bool:
     """True for a batch that uses none of: sampling (every request greedy), penalties (repetition / frequency / presence /
     min_new_tokens), logit_bias, custom logit processors, grammar. Host attributes only (no tensor access). Such a batch runs the
-    unmodified greedy round (no sampler call, no cumulation, no bitmask, no extra kernel or sync)."""
+    unmodified greedy round (no sampler call, no cumulation, no bitmask, no extra kernel or sync).
+
+    reqs (the batch's requests): greedy and logit_bias are read from them, as SamplingBatchInfo.from_schedule_batch computes
+    is_all_greedy. The batch-level fields are not recomputed when requests leave: filter_batch keeps is_all_greedy (merge_batch only
+    ANDs it) and keeps a logit_bias tensor once one request has set it, so after a single sampled or logit_bias request has passed
+    through, they would keep every later greedy batch off the plain round. The penalizer orchestrator and has_custom_logit_processor
+    are recomputed by filter_batch. Without reqs the batch-level fields are used."""
     si = sampling_info
     if si is None:
         return not has_grammar
     orch = si.penalizer_orchestrator
+    if reqs is None:
+        greedy, bias = bool(si.is_all_greedy), si.logit_bias is not None
+    else:
+        greedy = all(r.sampling_params.top_k <= 1 for r in reqs)
+        bias = any(r.sampling_params.logit_bias is not None for r in reqs)
     return (
-        bool(si.is_all_greedy)
+        greedy
         and (orch is None or not orch.is_required)
-        and si.logit_bias is None
+        and not bias
         and not si.has_custom_logit_processor
         and not has_grammar
     )
+
+
+def clear_cached_vocab_mask(grammars, vocab_size: int, batch_size: int, device) -> None:
+    """Set rows [:batch_size] of the grammar backend's mask buffer to all-allowed (-1) before an upstream helper allocates and
+    fills it (SamplingBatchInfo.update_regex_vocab_mask for a0, spec_utils.generate_token_bitmask for the SELFSPEC_FULLDRAFT=0
+    verify rows). Those helpers take the mask from the first grammar's allocate_vocab_mask and write only the rows of live
+    grammars; every other row (a request without a grammar, a finished or terminated grammar, a reasoner grammar still thinking)
+    must stay all-allowed. xgrammar's allocator returns a fresh all-allowed mask, but llguidance's returns rows of a buffer cached on
+    the grammar object, unchanged since the previous call: a full-draft verify writes request i's chain into rows i*K..i*K+K-1 of
+    it, so the next round's a0 mask of another request would be a stale row of that chain. Clearing the same rows here, through the
+    same first grammar and the same arguments, leaves the helper a cleared buffer (the allocation is cached, so the helper gets the
+    rows just cleared); for xgrammar it costs one small CPU allocation. grammars: the per-row grammar list (None for a row without
+    one); the first truthy entry is the helper's first grammar."""
+    first = next((g for g in grammars if g), None)
+    if first is None:
+        return
+    first.allocate_vocab_mask(vocab_size=vocab_size, batch_size=batch_size, device=device).fill_(-1)
 
 
 # ------------------------------------------------------------------------------------------------ penalizer state
