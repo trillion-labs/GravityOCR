@@ -17,7 +17,7 @@ evaluate==0.4.3
 filelock==3.29.4
 fonttools==4.63.0
 frozenlist==1.8.0
-fsspec==2026.4.0
+fsspec==2026.6.0
 func-timeout==4.3.5
 h11==0.16.0
 hf-xet==1.5.1
