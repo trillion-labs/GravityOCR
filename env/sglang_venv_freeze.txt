@@ -35,7 +35,7 @@ flash-attn-4==4.0.0b19
 flashinfer-cubin==0.6.7.post2
 flashinfer-python==0.6.7.post2
 frozenlist==1.8.0
-fsspec==2026.4.0
+fsspec==2026.6.0
 gguf==0.19.0
 grpcio==1.81.1
 grpcio-health-checking==1.81.1
